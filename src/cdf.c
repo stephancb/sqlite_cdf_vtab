@@ -3179,7 +3179,7 @@ static sqlite3_module CdfAttrzEntriesModule = {
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
-int sqlite3_cdfn_init(
+int sqlite3_cdf_init(
   sqlite3 *db, 
   char **pzErrMsg, 
   const sqlite3_api_routines *pApi
