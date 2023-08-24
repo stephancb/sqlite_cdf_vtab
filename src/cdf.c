@@ -332,7 +332,7 @@ static int cdfFileConnect(
 
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_file_ignored (\n");
     sqlite3_str_appendf(zsql, "    cdfid INTEGER PRIMARY KEY,\n");
-    sqlite3_str_appendf(zsql, "    name TEXT NOT NULL\n) WITHOUT ROWID;\n");
+    sqlite3_str_appendf(zsql, "    name TEXT NOT NULL\n);\n");
     rc = sqlite3_declare_vtab(db, sqlite3_str_value(zsql));
     if( rc!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("Bad schema \n%s\nerror code: %d\n", z, rc);
@@ -897,7 +897,7 @@ static CDFstatus result_padvalue(sqlite3_context *ctx, CDFid id, long kzvar) {
     }
     CDFdataFree(value);
 
-    return status;
+    return SQLITE_OK;
 }
 static CDFstatus result_setpad(sqlite3_context *ctx, CDFid id, long kzvar) {
     CDFstatus status;

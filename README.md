@@ -6,6 +6,9 @@ Common Data Fromat (CDF) is a self-describing data format for the storage of sca
 
 CDF is used in Space Physics and curated by the NASA GSFC: [https://cdf.gsfc.nasa.gov/](https://cdf.gsfc.nasa.gov/)
 
+File `testcdfn.sql` is a script for the SQLite CLI `sqlite3`, with examples how to create a CDF files with zVariables and to insert records and attributes.
+
+
 Examples:
 
 SELECT load_extension('/pathtoextensions/cdfzvars');

@@ -5,8 +5,7 @@
 
 -- load the vector and cdfn extensions:
 SELECT load_extension((SELECT $home FROM sqlite_parameters)||'/'||(SELECT $prefix FROM sqlite_parameters)||'/vector');
--- SELECT load_extension((SELECT $home FROM sqlite_parameters)||'/'||(SELECT $prefix FROM sqlite_parameters)||'/cdfn');
-SELECT load_extension('/home/scb/code/sqlite/vtabs/cdfn');
+SELECT load_extension((SELECT $home FROM sqlite_parameters)||'/'||(SELECT $prefix FROM sqlite_parameters)||'/cdf');
 
 .mode list
 SELECT '----- '||datetime('now')||' -----';
@@ -16,12 +15,12 @@ SELECT printf('');
 
 -- create a test CDF file
 -- it cannot exist before
-.system touch /home/scb/data/cdf/testzvars2.cdf
-.system rm /home/scb/data/cdf/testzvars2.cdf
+.system touch ./testzvars2.cdf
+.system rm ./testzvars2.cdf
 -- .system ls -l /home/scb/data/cdf
 SELECT printf('Creating virtual table:');
 SELECT printf('CREATE VIRTUAL TABLE t2 USING cdffile(''/home/scb/data/cdf/testzvars2'', ''c'');');
-CREATE VIRTUAL TABLE t2 USING cdffile('/home/scb/data/cdf/testzvars2', 'c');
+CREATE VIRTUAL TABLE t2 USING cdffile('./testzvars2', 'c');
 SELECT printf('');
 SELECT printf('Virtual table t2 and related were created. The following tables exist:');
 .mode box
