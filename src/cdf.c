@@ -2865,7 +2865,7 @@ static int cdfAttrzEntriesNext(sqlite3_vtab_cursor *curp) {
             *pzErr = sqlite3_mprintf("no more attributes??\n");
             return SQLITE_OK;
         }
-        status = CDFgetAttrMaxgEntry(cp->id, cp->attrid-1, &maxentry);
+        status = CDFgetAttrMaxzEntry(cp->id, cp->attrid-1, &maxentry);
         cp->entryid = 1;
         while( cp->entryid-1<=maxentry ) { /* Omit empty entries, at least one non-empty should exist */
             status = CDFgetAttrzEntryNumElements(cp->id, cp->attrid-1, cp->entryid-1, &nelems);

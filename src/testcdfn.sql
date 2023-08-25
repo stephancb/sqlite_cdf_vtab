@@ -19,7 +19,7 @@ SELECT printf('');
 .system rm ./testzvars2.cdf
 -- .system ls -l /home/scb/data/cdf
 SELECT printf('Creating virtual table:');
-SELECT printf('CREATE VIRTUAL TABLE t2 USING cdffile(''/home/scb/data/cdf/testzvars2'', ''c'');');
+SELECT printf('CREATE VIRTUAL TABLE t2 USING cdffile(''./testzvars2'', ''c'');');
 CREATE VIRTUAL TABLE t2 USING cdffile('./testzvars2', 'c');
 SELECT printf('');
 SELECT printf('Virtual table t2 and related were created. The following tables exist:');
