@@ -548,6 +548,7 @@ struct CdfzVarsCursor {
     sqlite3_vtab_cursor base;       /* Base class.  Must be first */
     CDFid id;                       /* CDF file identifier. */
     sqlite_int64 zvarid;            /* The current rowid. */
+    sqlite_int64 lastrow;           /* The last zvar, which the cursor should reach */
 };
 
 static int cdf_prep_idmode(
@@ -653,39 +654,16 @@ static int cdfzVarsConnect(
     sqlite3_str_appendf(zsql, "    dimvariances BLOB DEFAULT NULL,\n");
     sqlite3_str_appendf(zsql, "    maxwritten INTEGER DEFAULT 0,\n");
     sqlite3_str_appendf(zsql, "    maxalloc INTEGER DEFAULT 0,\n");
-    sqlite3_str_appendf(zsql, "    padvalue,\n");
-    sqlite3_str_appendf(zsql, "    defpad INTEGER DEFAULT 1\n");
+    sqlite3_str_appendf(zsql, "    padvalue\n");
     sqlite3_str_appendf(zsql, ");\n");
 
     return cdf_createvtab(db, zsql, id, mode, argv[2], pzErr, ppVtab);
 }
 
-/*
-** This method is the destructor fo a CdfVTab object.
-*/
-/* Not used
-static int cdfzVarsDisconnect(sqlite3_vtab *pVtab){
-    CDFstatus status=CDF_OK;
-    CdfVTab* vp = (CdfVTab*) pVtab;
-
-    if( vp->mode!='s' && vp->mode!='t' ) {
-        status = CDFcloseCDF(vp->id);
-        if( status!=CDF_OK) {
-            char statustext[CDF_STATUSTEXT_LEN+1];
-            CDFgetStatusText(status, statustext);
-            char **pzErr = &pVtab->zErrMsg;
-            *pzErr = sqlite3_mprintf("Closing CDF file failed:\n%s", statustext);
-            return SQLITE_ERROR;
-        }
-    }
-    sqlite3_free(vp);
-
-    return SQLITE_OK;
-} */
 
 /*
-** Only a forward full table scan is supported. xBestIndex becomes mostly a no-op.
 ** For a clause like WHERE name=='zVarName' use CDFgetVarNum instead of a full table scan.
+** Forward full table scan is supported. xBestIndex becomes mostly a no-op.
 */
 static int cdfzVarsBestIndex(
         sqlite3_vtab *vtabp,
@@ -734,10 +712,14 @@ static int cdfzVarsFilter(
 {
     CdfzVarsCursor *cp = (CdfzVarsCursor*) curp;
 
+    CDFstatus status = CDFgetNumzVars(cp->id, &(cp->lastrow));
+
     if( idxNum==SQLITE_INDEX_CONSTRAINT_EQ && argc>0 ) {
         const char *varname = sqlite3_value_text(argv[0]);
         long varnum = CDFgetVarNum(cp->id, (char*) varname);
-        cp->zvarid = varnum+1;
+        /* printf("zVarsFilter: varname = %s, varnum = %d\n", varname, varnum); */
+        cp->zvarid  = varnum+1;
+        cp->lastrow = cp->zvarid;
     } else
         cp->zvarid = 1;
 
@@ -749,9 +731,7 @@ static int cdfzVarsFilter(
 */
 static int cdfzVarsEof(sqlite3_vtab_cursor *curp){
     CdfzVarsCursor *cp = (CdfzVarsCursor*) curp;
-    long nzvars;
-    CDFstatus status = CDFgetNumzVars(cp->id, &nzvars);
-    return cp->zvarid > nzvars;
+    return cp->zvarid > cp->lastrow;
 }
 
 static CDFstatus result_zvarid(sqlite3_context *ctx, CDFid id, long kzvar) {
@@ -880,6 +860,10 @@ static CDFstatus result_padvalue(sqlite3_context *ctx, CDFid id, long kzvar) {
         case SQLITE_INTEGER:
             if( datatype==CDF_INT8 )
                 sqlite3_result_int64(ctx, ((sqlite3_int64*) value)[0]);
+            else if( datatype==CDF_INT2 || datatype==CDF_UINT2 )
+                sqlite3_result_int(ctx, (int) ((short*) value)[0]);
+            else if( datatype==CDF_INT1 || datatype==CDF_UINT1 )
+                sqlite3_result_int(ctx, (int) ((char*) value)[0]);
             else
                 sqlite3_result_int(ctx, ((int*) value)[0]);
             break;
@@ -899,10 +883,11 @@ static CDFstatus result_padvalue(sqlite3_context *ctx, CDFid id, long kzvar) {
 
     return SQLITE_OK;
 }
-static CDFstatus result_setpad(sqlite3_context *ctx, CDFid id, long kzvar) {
+static CDFstatus result_padset(sqlite3_context *ctx, CDFid id, long kzvar) {
     CDFstatus status;
 
-    if( (status=CDFconfirmzVarPadValueExistence(id, kzvar-1))==CDF_OK )
+    printf("result_padset: status = %d\n", CDFconfirmzVarPadValueExistence(id, kzvar-1));
+    if( (status=CDFconfirmzVarPadValueExistence(id, kzvar-1))==NO_PADVALUE_SPECIFIED )
         sqlite3_result_int(ctx, 1);
     else
         sqlite3_result_int(ctx, 0);
@@ -924,7 +909,7 @@ static int cdfzVarsColumn(
     static CDFstatus (*res[12])(sqlite3_context*, CDFid, long) = {result_zvarid,
         result_varname, result_datatype, result_numelements, result_numdims, result_dimsizes,
         result_recvariance, result_dimvariances, result_maxwrittenrec, result_maxallocrec,
-        result_padvalue, result_setpad};
+        result_padvalue};
 
     if( sqlite3_vtab_nochange(ctx) ) return SQLITE_OK;
 
@@ -1067,239 +1052,197 @@ static int cdfzVarsUpdate(
             }
             break;
         default:  /* create or update a zVar */
-            if( sqlite3_value_type(argv[0])==SQLITE_NULL ) { /* create a zVar */
-                varName = sqlite3_value_text(argv[3]);
+            switch( sqlite3_value_type(argv[0]) ) {
+                case SQLITE_NULL: /* SQLite INSERT creates a zVar: */
+                    varName = sqlite3_value_text(argv[3]);
 
-                if( sqlite3_value_type(argv[4])==SQLITE_INTEGER || sqlite3_value_type(argv[4])==SQLITE_FLOAT ) {
-                    datatype = sqlite3_value_int64(argv[4]);
-                    if( datatype>CDF_UCHAR || datatype<CDF_INT1 || datatype==3 || datatype==13 ||
-                            (datatype>4  && datatype<8)  || (datatype>8 && datatype<11) ||
-                            (datatype>14 && datatype<21) || (datatype>22 && datatype<31) ||
-                            (datatype>33 && datatype<41) || (datatype>41 && datatype<44) ||
-                            (datatype>45 && datatype<51) ) {
-                        vtabp->zErrMsg = sqlite3_mprintf("Invalid datatype %d for zVar %s",
-                                datatype, varName);
-                        return SQLITE_ERROR;
-                    }
-                }
-                else if( sqlite3_value_type(argv[4])==SQLITE_TEXT ) { /* CDF datatype */
-                    datatype = cdf_typeid(sqlite3_value_text(argv[4]));
-                    if( datatype==0 ) {
-                        vtabp->zErrMsg = sqlite3_mprintf("Unknown typestring %s for zVar %s",
-                                sqlite3_value_text(argv[4]), varName);
-                          return SQLITE_ERROR;
-                    }
-                } else if( sqlite3_value_type(argv[4])==SQLITE_NULL )
-                    datatype = 45;
-                else {
-                    vtabp->zErrMsg = sqlite3_mprintf("Illegal BLOB for dataspec zVar %s", varName);
-                    return SQLITE_ERROR;
-                }
-
-                if( datatype==51 || datatype==52 )
-                    if( sqlite3_value_type(argv[5])==SQLITE_NULL )
-                        numelem = 64;
-                    else
-                        numelem = sqlite3_value_int64(argv[5]);
-                else
-                    numelem = 1;
-
-                numdims = sqlite3_value_int64(argv[6]);
-                if( numdims==0 ) {
-                    dimsize  = 0;
-                    dimsizes = &dimsize;
-                } else if( numdims==1 ) {   /* vector */
-                    dimsize  = sqlite3_value_int64(argv[7]);
-                    if( dimsize<=0 ) {
-                        vtabp->zErrMsg = sqlite3_mprintf("Invalid dimsize %d!", dimsize);
-                        return SQLITE_ERROR;
-                    }
-                    dimsizes = &dimsize;
-                } else if( numdims>1 )  { /* matrix or higher, numdims must be string */
-                    dimsizes = sqlite3_malloc(numdims*sizeof(long));
-                    if( sqlite3_value_type(argv[7])==SQLITE_TEXT ) {
-                        dimparstr = sqlite3_malloc(sqlite3_value_bytes(argv[7]));
-                        strcpy(dimparstr, sqlite3_value_text(argv[7]));
-                        dimsizes[0] = strtol(dimparstr, &dimpp, 0);
-                        for( k=1; k<numdims; k++ )
-                            dimsizes[k] = strtol(dimpp+1, &dimpp, 0);
-                        sqlite3_free(dimparstr);
-                    } else {
-                        vtabp->zErrMsg = sqlite3_mprintf("Invalid dimsizes of type %d!",
-                                sqlite3_value_type(argv[7]));
-                        return SQLITE_ERROR;
-                    }
-                } else if( numdims<0 ) {
-                    vtabp->zErrMsg = sqlite3_mprintf("Invalid numdims %d!", numdims);
-                    return SQLITE_ERROR;
-                }
-
-                if( sqlite3_value_type(argv[8])!=SQLITE_NULL ) {
-                    recvariance = sqlite3_value_int64(argv[8]);
-                    if( recvariance!=VARY && recvariance!=NOVARY ) {
-                        vtabp->zErrMsg = sqlite3_mprintf("Invalid recvariance %d!", recvariance);
-                        return SQLITE_ERROR;
-                    }
-                } else recvariance = VARY;
-
-                if( numdims==0 ) {
-                    dimvar  = VARY;
-                    dimvars = &dimvar;
-                } else if( numdims==1 ) {   /* vector, default dim variance is VARY  */
-                    dimvar  = sqlite3_value_type(argv[9])==SQLITE_NULL ? VARY : sqlite3_value_int64(argv[9]);
-                    dimvars = &dimvar;
-                } else if( numdims>1 )  { /* matrix or higher, recvars must be string */
-                    dimvars = sqlite3_malloc(numdims*sizeof(long));
-                    if( sqlite3_value_type(argv[9])==SQLITE_TEXT ) {
-                        dimparstr = sqlite3_malloc(sqlite3_value_bytes(argv[9]));
-                        strcpy(dimparstr, sqlite3_value_text(argv[9]));
-                        dimvars[0] = strtol(dimparstr, &dimpp, 0);
-                        for( k=1; k<numdims; k++ )
-                            dimvars[k] = strtol(dimpp+1, &dimpp, 0);
-                        sqlite3_free(dimparstr);
-                    } else if ( sqlite3_value_type(argv[9])==SQLITE_NULL )
-                        for( k=0; k<numdims; k++ )
-                            dimvars[k] = VARY;
-                } else {
-                    vtabp->zErrMsg = sqlite3_mprintf("Invalid varsizes of type %d!",
-                            sqlite3_value_type(argv[9]));
-                    return SQLITE_ERROR;
-                }
-                if( numdims>0 )
-                    for( k=0; k<numdims; k++ )
-                        if( dimvars[k]!=VARY && dimvars[k]!=NOVARY ) {
-                            vtabp->zErrMsg = sqlite3_mprintf("Invalid dimvariance %d!", dimvars[k]);
+                    if( sqlite3_value_type(argv[4])==SQLITE_INTEGER || sqlite3_value_type(argv[4])==SQLITE_FLOAT ) {
+                        datatype = sqlite3_value_int64(argv[4]);
+                        if( datatype>CDF_UCHAR || datatype<CDF_INT1 || datatype==3 || datatype==13 ||
+                                (datatype>4  && datatype<8)  || (datatype>8 && datatype<11) ||
+                                (datatype>14 && datatype<21) || (datatype>22 && datatype<31) ||
+                                (datatype>33 && datatype<41) || (datatype>41 && datatype<44) ||
+                                (datatype>45 && datatype<51) ) {
+                            vtabp->zErrMsg = sqlite3_mprintf("Invalid datatype %d for zVar %s",
+                                    datatype, varName);
                             return SQLITE_ERROR;
                         }
-
-                if( sqlite3_value_type(argv[10])!=SQLITE_NULL ) {
-                    vtabp->zErrMsg = sqlite3_mprintf("Column maxwritten is read-only!");
-                    return SQLITE_ERROR;
-                }
-
-                status = CDFgetNumzVars(vp->id, &nzvars);
-                status = CDFcreatezVar(vp->id, varName, datatype, numelem, numdims, dimsizes,
-                        recvariance, dimvars, &varnum);
-                if( status<CDF_OK ) {
-                    char statustext[CDF_STATUSTEXT_LEN+1];
-                    CDFgetStatusText(status, statustext);
-                    vtabp->zErrMsg = sqlite3_mprintf("Creating zvar %s failed:\n%s", varName, statustext);
-                    return SQLITE_ERROR;
-                } /* else
-                    printf("zVarsUpdate: zvar %s created\n", varName); */
-                if( nzvars!=varnum ) {
-                    vtabp->zErrMsg = sqlite3_mprintf("Creating zvar %s failed:\n var number %d should be %d\n",
-                            varName, varnum, nzvars);
-                    return SQLITE_ERROR;
-                }
-
-                if( sqlite3_value_type(argv[11])!=SQLITE_NULL ) { /* maxalloc */
-                    long nalloc = sqlite3_value_int64(argv[11]);
-                    status = CDFsetzVarAllocRecords(vp->id, varnum, nalloc);
-                    if( status<CDF_OK ) {
-                        char statustext[CDF_STATUSTEXT_LEN+1];
-                        CDFgetStatusText(status, statustext);
-                        vtabp->zErrMsg = sqlite3_mprintf("Allocating records for %s failed: %s",
-                                varName, statustext);
+                    }
+                    else if( sqlite3_value_type(argv[4])==SQLITE_TEXT ) { /* CDF datatype */
+                        datatype = cdf_typeid(sqlite3_value_text(argv[4]));
+                        if( datatype==0 ) {
+                            vtabp->zErrMsg = sqlite3_mprintf("Unknown typestring %s for zVar %s",
+                                    sqlite3_value_text(argv[4]), varName);
+                            return SQLITE_ERROR;
+                        }
+                    } else if( sqlite3_value_type(argv[4])==SQLITE_NULL )
+                        datatype = 45;
+                    else {
+                        vtabp->zErrMsg = sqlite3_mprintf("Illegal BLOB for dataspec zVar %s", varName);
                         return SQLITE_ERROR;
                     }
-                }
 
-                /* pad value: */ 
-                if( zvars_upd_padval(argv, vp->id, varnum, &vtabp->zErrMsg)!=SQLITE_OK )
-                    return SQLITE_ERROR;
-                /*
-                if( sqlite3_value_type(argv[12])!=SQLITE_NULL ) { /* pad value*/ /*
-                    switch (datatype) {
-                        case CDF_REAL8:
-                        case CDF_DOUBLE:
-                        case CDF_EPOCH:
-                            double d = sqlite3_value_double(argv[12]);
-                            CDFsetzVarPadValue(vp->id, varnum, &d);
-                            break;
-                        case CDF_INT8:
-                            long l = sqlite3_value_int64(argv[12]);
-                            CDFsetzVarPadValue(vp->id, varnum, &l);
-                            break;
-                        case CDF_INT4:
-                        case CDF_UINT4:
-                        case CDF_INT2:
-                        case CDF_UINT2:
-                        case CDF_INT1:
-                        case CDF_UINT1:
-                        case CDF_BYTE:
-                            int i = sqlite3_value_int(argv[12]);
-                            CDFsetzVarPadValue(vp->id, varnum, &i);
-                            break;
-                        case CDF_CHAR:
-                        case CDF_UCHAR:
-                            CDFsetzVarPadValue(vp->id, varnum, (char*) sqlite3_value_text(argv[12]));
-                            break;
-                        case CDF_REAL4:
-                        case CDF_FLOAT:
-                            float f = (float) sqlite3_value_double(argv[12]);
-                            CDFsetzVarPadValue(vp->id, varnum, &f);
-                            break;
-                        case CDF_EPOCH16:
-                            if( sqlite3_value_bytes(argv[12])!=16 ) {
-                                vtabp->zErrMsg = sqlite3_mprintf("Pad value for EPOCH16 must be 16 bytes");
+                    if( datatype==51 || datatype==52 )
+                        if( sqlite3_value_type(argv[5])==SQLITE_NULL )
+                            numelem = 64;
+                        else
+                            numelem = sqlite3_value_int64(argv[5]);
+                    else
+                        numelem = 1;
+
+                    numdims = sqlite3_value_int64(argv[6]);
+                    if( numdims==0 ) {
+                        dimsize  = 0;
+                        dimsizes = &dimsize;
+                    } else if( numdims==1 ) {   /* vector */
+                        dimsize  = sqlite3_value_int64(argv[7]);
+                        if( dimsize<=0 ) {
+                            vtabp->zErrMsg = sqlite3_mprintf("Invalid dimsize %d!", dimsize);
+                            return SQLITE_ERROR;
+                        }
+                        dimsizes = &dimsize;
+                    } else if( numdims>1 )  { /* matrix or higher, numdims must be string */
+                        dimsizes = sqlite3_malloc(numdims*sizeof(long));
+                        if( sqlite3_value_type(argv[7])==SQLITE_TEXT ) {
+                            dimparstr = sqlite3_malloc(sqlite3_value_bytes(argv[7]));
+                            strcpy(dimparstr, sqlite3_value_text(argv[7]));
+                            dimsizes[0] = strtol(dimparstr, &dimpp, 0);
+                            for( k=1; k<numdims; k++ )
+                                dimsizes[k] = strtol(dimpp+1, &dimpp, 0);
+                            sqlite3_free(dimparstr);
+                        } else {
+                            vtabp->zErrMsg = sqlite3_mprintf("Invalid dimsizes of type %d!",
+                                    sqlite3_value_type(argv[7]));
+                            return SQLITE_ERROR;
+                        }
+                    } else if( numdims<0 ) {
+                        vtabp->zErrMsg = sqlite3_mprintf("Invalid numdims %d!", numdims);
+                        return SQLITE_ERROR;
+                    }
+
+                    if( sqlite3_value_type(argv[8])!=SQLITE_NULL ) {
+                        recvariance = sqlite3_value_int64(argv[8]);
+                        if( recvariance!=VARY && recvariance!=NOVARY ) {
+                            vtabp->zErrMsg = sqlite3_mprintf("Invalid recvariance %d!", recvariance);
+                            return SQLITE_ERROR;
+                        }
+                    } else recvariance = VARY;
+
+                    if( numdims==0 ) {
+                        dimvar  = VARY;
+                        dimvars = &dimvar;
+                    } else if( numdims==1 ) {   /* vector, default dim variance is VARY  */
+                        dimvar  = sqlite3_value_type(argv[9])==SQLITE_NULL ? VARY : sqlite3_value_int64(argv[9]);
+                        dimvars = &dimvar;
+                    } else if( numdims>1 )  { /* matrix or higher, recvars must be string */
+                        dimvars = sqlite3_malloc(numdims*sizeof(long));
+                        if( sqlite3_value_type(argv[9])==SQLITE_TEXT ) {
+                            dimparstr = sqlite3_malloc(sqlite3_value_bytes(argv[9]));
+                            strcpy(dimparstr, sqlite3_value_text(argv[9]));
+                            dimvars[0] = strtol(dimparstr, &dimpp, 0);
+                            for( k=1; k<numdims; k++ )
+                                dimvars[k] = strtol(dimpp+1, &dimpp, 0);
+                            sqlite3_free(dimparstr);
+                        } else if ( sqlite3_value_type(argv[9])==SQLITE_NULL )
+                            for( k=0; k<numdims; k++ )
+                                dimvars[k] = VARY;
+                    } else {
+                        vtabp->zErrMsg = sqlite3_mprintf("Invalid varsizes of type %d!",
+                                sqlite3_value_type(argv[9]));
+                        return SQLITE_ERROR;
+                    }
+                    if( numdims>0 )
+                        for( k=0; k<numdims; k++ )
+                            if( dimvars[k]!=VARY && dimvars[k]!=NOVARY ) {
+                                vtabp->zErrMsg = sqlite3_mprintf("Invalid dimvariance %d!", dimvars[k]);
                                 return SQLITE_ERROR;
                             }
-                            CDFsetzVarPadValue(vp->id, varnum, (void*) sqlite3_value_blob(argv[12]));
-                            break;
-                        default:
-                            vtabp->zErrMsg = sqlite3_mprintf("Illegal CDF datatype %d for pad value %d", datatype, varnum);
-                            return SQLITE_ERROR;
+
+                    if( sqlite3_value_type(argv[10])!=SQLITE_NULL ) {
+                        vtabp->zErrMsg = sqlite3_mprintf("Column maxwritten is read-only!");
+                        return SQLITE_ERROR;
                     }
-                }
-            */
 
-                if( numdims>1 ) {
-                    sqlite3_free(dimsizes);
-                    sqlite3_free(dimvars);
-                }
-                /* update the zrec virtual table: */
-                if( (rc = cdf_recreate_zrecs(vp))!=SQLITE_OK )
-                    return rc;
-            } else {  /* update or rename a zVariable */
-                long change = 0;
-                for( k=4; k<11; k++ ) 
-                    change += 1-sqlite3_value_nochange(argv[k]);
-
-                if( change ) {
-                    vtabp->zErrMsg = sqlite3_mprintf("zVar can be only be renamed or max allocated records or pad value can be updated");
-                    return SQLITE_ERROR;
-                }
-                varnum = sqlite3_value_int64(argv[0])-1;
-                if( !sqlite3_value_nochange(argv[3]) ) {
-                    varName = sqlite3_value_text(argv[3]);
-                    status = CDFrenamezVar(vp->id, varnum, varName);
+                    status = CDFgetNumzVars(vp->id, &nzvars);
+                    status = CDFcreatezVar(vp->id, varName, datatype, numelem, numdims, dimsizes,
+                            recvariance, dimvars, &varnum);
                     if( status<CDF_OK ) {
                         char statustext[CDF_STATUSTEXT_LEN+1];
                         CDFgetStatusText(status, statustext);
-                        vtabp->zErrMsg = sqlite3_mprintf("Renaming zvarid %d failed:\n%s",
-                                varnum+1, statustext);
+                        vtabp->zErrMsg = sqlite3_mprintf("Creating zvar %s failed:\n%s", varName, statustext);
                         return SQLITE_ERROR;
+                    } /* else
+                         printf("zVarsUpdate: zvar %s created\n", varName); */
+                    if( nzvars!=varnum ) {
+                        vtabp->zErrMsg = sqlite3_mprintf("Creating zvar %s failed:\n var number %d should be %d\n",
+                                varName, varnum, nzvars);
+                        return SQLITE_ERROR;
+                    }
+
+                    if( sqlite3_value_type(argv[11])!=SQLITE_NULL ) { /* maxalloc */
+                        long nalloc = sqlite3_value_int64(argv[11]);
+                        status = CDFsetzVarAllocRecords(vp->id, varnum, nalloc);
+                        if( status<CDF_OK ) {
+                            char statustext[CDF_STATUSTEXT_LEN+1];
+                            CDFgetStatusText(status, statustext);
+                            vtabp->zErrMsg = sqlite3_mprintf("Allocating records for %s failed: %s",
+                                    varName, statustext);
+                            return SQLITE_ERROR;
+                        }
+                    }
+
+                    /* pad value: */ 
+                    if( zvars_upd_padval(argv, vp->id, varnum, &vtabp->zErrMsg)!=SQLITE_OK )
+                        return SQLITE_ERROR;
+
+                    if( numdims>1 ) {
+                        sqlite3_free(dimsizes);
+                        sqlite3_free(dimvars);
                     }
                     /* update the zrec virtual table: */
                     if( (rc = cdf_recreate_zrecs(vp))!=SQLITE_OK )
-                            return rc;
-                }
-                if( !sqlite3_value_nochange(argv[11]) ) {
-                    long nalloc = sqlite3_value_int64(argv[11]);
-                    status = CDFsetzVarAllocRecords(vp->id, varnum, nalloc);
-                    if( status<CDF_OK ) {
-                        char statustext[CDF_STATUSTEXT_LEN+1];
-                        CDFgetStatusText(status, statustext);
-                        vtabp->zErrMsg = sqlite3_mprintf("Allocating records for zvarid %d failed:\n%s",
-                                varnum+1, statustext);
+                        return rc;
+                    break;
+                default:  /* SQLite UPDATE can rename a zVariable, change the max allocated record or the pad value: */
+                    long change = 0;
+                    for( k=4; k<11; k++ ) 
+                        change += 1-sqlite3_value_nochange(argv[k]);
+
+                    if( change ) {
+                        vtabp->zErrMsg = sqlite3_mprintf("zVar can be only be renamed or max allocated records or pad value can be updated");
                         return SQLITE_ERROR;
                     }
-                }
+                    varnum = sqlite3_value_int64(argv[0])-1;
+                    if( !sqlite3_value_nochange(argv[3]) ) {
+                        varName = sqlite3_value_text(argv[3]);
+                        status = CDFrenamezVar(vp->id, varnum, varName);
+                        if( status<CDF_OK ) {
+                            char statustext[CDF_STATUSTEXT_LEN+1];
+                            CDFgetStatusText(status, statustext);
+                            vtabp->zErrMsg = sqlite3_mprintf("Renaming zvarid %d failed:\n%s",
+                                    varnum+1, statustext);
+                            return SQLITE_ERROR;
+                        }
+                        /* update the zrec virtual table: */
+                        if( (rc = cdf_recreate_zrecs(vp))!=SQLITE_OK )
+                            return rc;
+                    }
+                    if( !sqlite3_value_nochange(argv[11]) ) {
+                        long nalloc = sqlite3_value_int64(argv[11]);
+                        status = CDFsetzVarAllocRecords(vp->id, varnum, nalloc);
+                        if( status<CDF_OK ) {
+                            char statustext[CDF_STATUSTEXT_LEN+1];
+                            CDFgetStatusText(status, statustext);
+                            vtabp->zErrMsg = sqlite3_mprintf("Allocating records for zvarid %d failed:\n%s",
+                                    varnum+1, statustext);
+                            return SQLITE_ERROR;
+                        }
+                    }
 
-                /* pad value: */ 
-                if( zvars_upd_padval(argv, vp->id, varnum, &vtabp->zErrMsg)!=SQLITE_OK )
-                    return SQLITE_ERROR;
+                    /* pad value: */ 
+                    if( !sqlite3_value_nochange(argv[12])
+                            && zvars_upd_padval(argv, vp->id, varnum, &vtabp->zErrMsg)!=SQLITE_OK )
+                        return SQLITE_ERROR;
             }
     }
     return SQLITE_OK;
@@ -2244,8 +2187,6 @@ static int cdfAttrgEntriesNext(sqlite3_vtab_cursor *curp) {
     status = CDFgetAttrMaxgEntry(cp->id, cp->attrid-1, &maxentry);
     while( cp->entryid<=nentries ) { /* Omit empty entries */
         status = CDFgetAttrgEntryNumElements(cp->id, cp->attrid-1, cp->entryid-1, &nelems);
-        printf("AttrgEntriesNext: status = %d, attrid = %d, entryid = %d, nelems = %d\n",
-                status, cp->attrid, cp->entryid, nelems);
         if( nelems>0 )
             break;
         cp->entryid++;
