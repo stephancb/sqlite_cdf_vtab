@@ -171,3 +171,9 @@ UPDATE t2_attrzents SET Value='n/a' WHERE Name='Units' AND zVar='Place';
 SELECT printf('Table t2_attrzents:');
 .mode box
 SELECT * FROM t2_attrzents;
+
+.mode list
+SELECT printf('');
+SELECT printf('cdfEpoch(..) extension function');
+.mode box
+SELECT cdfEpoch(2023, 8, 12, 3, 52, 4);
