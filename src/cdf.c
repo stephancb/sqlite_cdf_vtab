@@ -254,6 +254,13 @@ static int cdf_valfuncid(long cdftype) {
 
 static char* typetext[] = {"ANY", "INTEGER", "REAL", "TEXT", "BLOB", "NULL"};
 
+typedef struct CdfFileVTab CdfFileVTab;
+struct CdfFileVTab {     /* Includes also sybtables which must be dropped when destructed: */
+  CdfVTab      base;     /* Base class is the general CDFVtab */
+  long         nsubtabs; /* Nr of subtables */
+  char*        submodes; /* Modes of the subtabs  */
+  char**       names;    /* names of the virtual subtabs */
+};
 /*
 ** Parameters:
 **    file name       CDF filename (without ".cdf" extension)
@@ -274,7 +281,7 @@ static int cdfFileConnect(
     CDFid        id;
     char        *z;
     sqlite3_str *zsql = sqlite3_str_new(db);
-    CdfVTab     *filevtabp;
+    CdfFileVTab *filevtabp;
     char         name[CDF_PATHNAME_LEN+4],mstr[4],mode,submode;
     int          rc;
 
@@ -344,11 +351,11 @@ static int cdfFileConnect(
     filevtabp = sqlite3_malloc( sizeof(*filevtabp) );
     if( filevtabp==0 )
         return SQLITE_NOMEM;
-    filevtabp->id   = id;
-    filevtabp->mode = mode;
-    filevtabp->db   = db;
-    filevtabp->name = sqlite3_malloc( strlen(argv[2])+1 );
-    stpcpy(filevtabp->name, argv[2]);
+    filevtabp->base.id   = id;
+    filevtabp->base.mode = mode;
+    filevtabp->base.db   = db;
+    filevtabp->base.name = sqlite3_malloc( strlen(argv[2])+1 );
+    stpcpy(filevtabp->base.name, argv[2]);
 
     *ppVtab = (sqlite3_vtab*) filevtabp;
     
@@ -357,6 +364,14 @@ static int cdfFileConnect(
     else
         submode = 't';
 
+    filevtabp->nsubtabs = 5;
+    filevtabp->submodes = sqlite3_malloc(filevtabp->nsubtabs*sizeof(char));
+    if( filevtabp->submodes==0 )
+        return SQLITE_NOMEM;
+    filevtabp->names = sqlite3_malloc(filevtabp->nsubtabs*sizeof(char*));
+    if( filevtabp->names==0 )
+        return SQLITE_NOMEM;
+
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s_zvars USING cdfzvars('%d','%c')",
             argv[2], (long) id, submode);
@@ -364,6 +379,11 @@ static int cdfFileConnect(
         *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_zvars!\n", argv[2]);
         return rc;
     }
+    filevtabp->submodes[0] = submode;
+    filevtabp->names[0] = sqlite3_malloc(strlen(argv[2])+7);
+    if( filevtabp->names[0]==0 )
+        return SQLITE_NOMEM;
+    stpcpy(stpcpy(filevtabp->names[0], argv[2]), "_zvars");
     
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s_zrecs USING cdfzrecs('%d','%c')",
@@ -372,21 +392,50 @@ static int cdfFileConnect(
         *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_zrecs!\n", argv[2]);
         return rc;
     }
+    filevtabp->submodes[1] = submode;
+    filevtabp->names[1] = sqlite3_malloc(strlen(argv[2])+7);
+    if( filevtabp->names[1]==0 )
+        return SQLITE_NOMEM;
+    stpcpy(stpcpy(filevtabp->names[1], argv[2]), "_zrecs");
 
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s_attrs USING cdfattrs('%d','%c')",
             argv[2], (long) id, submode);
-    rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL);
+    if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
+        *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_attrs!\n", argv[2]);
+        return rc;
+    }
+    filevtabp->submodes[2] = submode;
+    filevtabp->names[2] = sqlite3_malloc(strlen(argv[2])+7);
+    if( filevtabp->names[2]==0 )
+        return SQLITE_NOMEM;
+    stpcpy(stpcpy(filevtabp->names[2], argv[2]), "_attrs");
 
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s_attrgents USING cdfattrgentries('%d','%c')",
             argv[2], (long) id, submode);
-    rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL);
+    if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
+        *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_attrgents!\n", argv[2]);
+        return rc;
+    }
+    filevtabp->submodes[3] = submode;
+    filevtabp->names[3] = sqlite3_malloc(strlen(argv[2])+11);
+    if( filevtabp->names[3]==0 )
+        return SQLITE_NOMEM;
+    stpcpy(stpcpy(filevtabp->names[3], argv[2]), "_attrgents");
 
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s_attrzents USING cdfattrzentries('%d','%c')",
             argv[2], (long) id, submode);
-    rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL);
+    if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
+        *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_attrzents!\n", argv[2]);
+        return rc;
+    }
+    filevtabp->submodes[4] = submode;
+    filevtabp->names[4] = sqlite3_malloc(strlen(argv[2])+11);
+    if( filevtabp->names[4]==0 )
+        return SQLITE_NOMEM;
+    stpcpy(stpcpy(filevtabp->names[4], argv[2]), "_attrzents");
 
     sqlite3_free(sqlite3_str_finish(zsql));
 
@@ -410,6 +459,32 @@ static int cdf_close(CdfVTab *pv){
     }
 
     return SQLITE_OK;
+}
+/*
+** This method is called when DROP TABLE ...
+** Also subtables must be dropped.
+*/
+static int cdfFileDisconnect(sqlite3_vtab *pvtab){
+    CdfFileVTab *fvp = (CdfFileVTab*) pvtab;
+    int rc = cdf_close(&(fvp->base));
+    sqlite3_str *zsql = sqlite3_str_new(fvp->base.db);
+
+    for( int kt=fvp->nsubtabs-1; kt>=0; kt-- ) {
+        sqlite3_str_reset(zsql);
+        sqlite3_str_appendf(zsql, "DROP TABLE %s", fvp->names[kt]);
+        rc = sqlite3_exec(fvp->base.db, sqlite3_str_value(zsql), NULL, NULL, NULL); 
+        sqlite3_free(fvp->names[kt]);
+    }
+
+    sqlite3_free(sqlite3_str_finish(zsql));
+
+    sqlite3_free(fvp->names);
+    sqlite3_free(fvp->submodes);
+
+    sqlite3_free(fvp->base.name);
+    sqlite3_free(fvp);
+
+    return rc;
 }
 /*
 ** This method is the destructor for CDF virtual tables.
@@ -531,26 +606,26 @@ static int cdfFileCreate(
 }
 
 static sqlite3_module CdfFileModule = {
-  0,                       /* iVersion */
-  cdfFileCreate,      /* xCreate */
-  cdfFileConnect,     /* xConnect */
-  cdfFileBestIndex,   /* xBestIndex */
-  cdfVTabDisconnect,  /* xDisconnect */
-  cdfVTabDisconnect,  /* xDestroy */
-  cdfVTabOpen,        /* xOpen - open a cursor */
-  cdfVTabClose,       /* xClose - close a cursor */
-  cdfVTabFilter,      /* xFilter - configure scan constraints */
-  cdfVTabNext,        /* xNext - advance a cursor */
-  cdfFileEof,         /* xEof - check for end of scan */
-  cdfFileColumn,      /* xColumn - read data */
-  cdfVTabRowid,       /* xRowid - read data */
-  0,                  /* xUpdate - not updatable */
-  0,                       /* xBegin */
-  0,                       /* xSync */
-  0,                       /* xCommit */
-  0,                       /* xRollback */
-  0,                       /* xFindMethod */
-  0,                       /* xRename */
+  0,                 /* iVersion */
+  cdfFileCreate,     /* xCreate */
+  cdfFileConnect,    /* xConnect */
+  cdfFileBestIndex,  /* xBestIndex */
+  cdfFileDisconnect, /* xDisconnect */
+  cdfFileDisconnect, /* xDestroy */
+  cdfVTabOpen,       /* xOpen - open a cursor */
+  cdfVTabClose,      /* xClose - close a cursor */
+  cdfVTabFilter,     /* xFilter - configure scan constraints */
+  cdfVTabNext,       /* xNext - advance a cursor */
+  cdfFileEof,        /* xEof - check for end of scan */
+  cdfFileColumn,     /* xColumn - read data */
+  cdfVTabRowid,      /* xRowid - read data */
+  0,                 /* xUpdate - not updatable */
+  0,                 /* xBegin */
+  0,                 /* xSync */
+  0,                 /* xCommit */
+  0,                 /* xRollback */
+  0,                 /* xFindMethod */
+  0,                 /* xRename */
 };
 
 /* A cursor for the CDF zVars virtual table */
@@ -1542,20 +1617,40 @@ static int cdfzRecsEof(sqlite3_vtab_cursor *curp){
     return cp->recid > zvarsmaxw+1;
 }
 
+/* Check whether the sequence position is ok, change if needed */
+static void cdf_seqpos(CDFid id, long kz, long kr) {
+    long recnum;
+    CDFstatus status = CDFgetzVarSeqPos(id, kz, &recnum, &recnum);
+    if( recnum!=kr )
+        status = CDFsetzVarSeqPos(id, kz, kr, recnum);
+}
+
 static CDFstatus result_cdfint(sqlite3_context *ctx, CDFid id, long lCol, long recid, long) {
     sqlite_int64 ibuf = 0;
-    CDFstatus status = CDFgetzVarRecordData(id, lCol-1, recid-1, &ibuf);
-    sqlite3_result_int64(ctx, ibuf);
+    cdf_seqpos(id, lCol-1, recid-1);
+    CDFstatus status = CDFgetzVarSeqData(id, lCol-1, &ibuf);
+    /* CDFstatus status = CDFgetzVarRecordData(id, lCol-1, recid-1, &ibuf); */
+    if( status==END_OF_VAR ) {
+        sqlite3_result_null(ctx);
+        return CDF_OK;
+    } else
+        sqlite3_result_int64(ctx, ibuf);
     
     return status;
 }
 
 static CDFstatus result_cdfdouble(sqlite3_context *ctx, CDFid id, long lCol, long recid, long) {
     double dbuf;
-    CDFstatus status = CDFgetzVarRecordData(id, lCol-1, recid-1, &dbuf);
-    sqlite3_result_double(ctx, dbuf);
-
-    return status;
+    cdf_seqpos(id, lCol-1, recid-1);
+    CDFstatus status = CDFgetzVarSeqData(id, lCol-1, &dbuf);
+    /* CDFstatus status = CDFgetzVarRecordData(id, lCol-1, recid-1, &dbuf); */
+    if( status==END_OF_VAR ) {
+        sqlite3_result_null(ctx);
+        return CDF_OK;
+    } else {
+        sqlite3_result_double(ctx, dbuf);
+        return status;
+    }
 }
 
 static CDFstatus result_cdftext(sqlite3_context *ctx, CDFid id, long lCol, long recid, long) {
@@ -1564,29 +1659,50 @@ static CDFstatus result_cdftext(sqlite3_context *ctx, CDFid id, long lCol, long 
     CDFstatus status = CDFgetzVarNumElements(id, lCol-1, &n);
     buf    = sqlite3_malloc64(n+1);
     memset(buf, 0, n+1);
-    status = CDFgetzVarRecordData(id, lCol-1, recid-1, buf);
-    /* sqlite3_result_text64(ctx, buf, n, sqlite3_free, SQLITE_UTF8); This does not seem to work with CDF */
-    sqlite3_result_text(ctx, buf, -1, sqlite3_free);
 
-    return status;
+    cdf_seqpos(id, lCol-1, recid-1);
+    status = CDFgetzVarSeqData(id, lCol-1, buf);
+    /* status = CDFgetzVarRecordData(id, lCol-1, recid-1, buf); */
+    /* sqlite3_result_text64(ctx, buf, n, sqlite3_free, SQLITE_UTF8); This does not seem to work with CDF */
+    if( status==END_OF_VAR ) {
+        sqlite3_result_null(ctx);
+        return CDF_OK;
+    } else {
+        sqlite3_result_text(ctx, buf, -1, sqlite3_free);
+        return status;
+    }
 }
 
 static CDFstatus result_cdfblob(sqlite3_context *ctx, CDFid id, long lCol, long recid, long nbytes) {
-    char buf8[8] = "";
+    char buf8[16] = "";
     char *buf;
     CDFstatus status;
 
-    if( nbytes<=8 ) {
-        status = CDFgetzVarRecordData(id, lCol-1, recid-1, buf8);
-        sqlite3_result_blob64(ctx, buf8, nbytes, SQLITE_TRANSIENT);
+    cdf_seqpos(id, lCol-1, recid-1);
+    if( nbytes<=16 ) {
+        status = CDFgetzVarSeqData(id, lCol-1, buf8);
+        /* status = CDFgetzVarRecordData(id, lCol-1, recid-1, buf8); */
+        if( status==END_OF_VAR ) {
+            sqlite3_result_null(ctx);
+            return CDF_OK;
+        } else {
+            sqlite3_result_blob64(ctx, buf8, nbytes, SQLITE_TRANSIENT);
+            return status;
+        }
     } else {
         buf    = sqlite3_malloc64(nbytes);
         memset(buf, 0, nbytes);
-        status = CDFgetzVarRecordData(id, lCol-1, recid-1, buf);
-        sqlite3_result_blob64(ctx, buf, nbytes, sqlite3_free);
+        status = CDFgetzVarSeqData(id, lCol-1, buf);
+        /* status = CDFgetzVarRecordData(id, lCol-1, recid-1, buf); */
+        if( status==END_OF_VAR ) {
+            sqlite3_result_null(ctx);
+            return CDF_OK;
+        } else {
+            sqlite3_result_blob64(ctx, buf, nbytes, sqlite3_free);
+            return status;
+        }
     }
 
-    return status;
 }
 
 /*
@@ -1639,32 +1755,41 @@ static int cdfzRecsColumn(
 static CDFstatus value_int64_2cdf(sqlite3_value *val, CDFid id, long kz, long kr, char**)
 {
     long icolval = sqlite3_value_int64(val);
-    return CDFputzVarRecordData(id, kz, kr, &icolval);
+    cdf_seqpos(id, kz, kr);
+    return CDFputzVarSeqData(id, kz, &icolval);
+    /* return CDFputzVarRecordData(id, kz, kr, &icolval); */
 }
 
 static CDFstatus value_double_2cdf(sqlite3_value *val, CDFid id, long kz, long kr, char**)
 {
     double dcolval = sqlite3_value_double(val);
-    return CDFputzVarRecordData(id, kz, kr, &dcolval);
+    cdf_seqpos(id, kz, kr);
+    return CDFputzVarSeqData(id, kz, &dcolval);
+    /* return CDFputzVarRecordData(id, kz, kr, &dcolval); */
 }
 
 static CDFstatus value_text_2cdf(sqlite3_value *val, CDFid id, long kz, long kr, char**)
 {
-    return CDFputzVarRecordData(id, kz, kr, (char*) sqlite3_value_text(val));
+    cdf_seqpos(id, kz, kr);
+    return CDFputzVarSeqData(id, kz,  (char*) sqlite3_value_text(val));
+    /* return CDFputzVarRecordData(id, kz, kr, (char*) sqlite3_value_text(val)); */
 }
 
 static CDFstatus value_float_2cdf(sqlite3_value *val, CDFid id, long kz, long kr, char **pzErr)
 {
     int sqltype = sqlite3_value_type(val);
+    cdf_seqpos(id, kz, kr);
     if( sqltype==SQLITE_BLOB ) {
         if( sqlite3_value_bytes(val)!=4 ) {
             *pzErr = sqlite3_mprintf("insert of binary FLOAT needs a 4 octets long BLOB");
             return SQLITE_ERROR;
         }
-        return CDFputzVarRecordData(id, kz, kr, (void*) sqlite3_value_blob(val));
+        return CDFputzVarSeqData(id, kz, (void*) sqlite3_value_blob(val));
+        /* return CDFputzVarRecordData(id, kz, kr, (void*) sqlite3_value_blob(val)); */
     } else {
         float fcolval = (float) sqlite3_value_double(val);
-        return CDFputzVarRecordData(id, kz, kr, &fcolval);
+        return CDFputzVarSeqData(id, kz, &fcolval);
+        /* return CDFputzVarRecordData(id, kz, kr, &fcolval); */
     }
 }
 
@@ -1674,8 +1799,10 @@ static CDFstatus value_epoch_2cdf(sqlite3_value *val, CDFid id, long kz, long kr
             *pzErr = sqlite3_mprintf("insert of CDF_EPOCH16 needs a 16 octets long BLOB");
             return SQLITE_ERROR;
     }
+    cdf_seqpos(id, kz, kr);
 
-    return CDFputzVarRecordData(id, kz, kr, (void*) sqlite3_value_blob(val));
+    return CDFputzVarSeqData(id, kz,  (void*) sqlite3_value_blob(val));
+    /* return CDFputzVarRecordData(id, kz, kr, (void*) sqlite3_value_blob(val)); */
 }
 
 static CDFstatus (*valfunc[5])(sqlite3_value*, CDFid, long, long, char**) = {
