@@ -26,9 +26,14 @@ extension](https://www.sqlite.org/loadext.html):
 
 - in the [CLI](https://www.sqlite.org/cli.html) with the dot command `.load`
 
-Loading extensions in SQLite must have been enabled, see
-[here](https://www.sqlite.org/c3ref/enable_load_extension.html). In the CLI loading
-extension is enabled by default.
+First the loading of extensions in SQLite must have enabled, see
+[here](https://www.sqlite.org/c3ref/enable_load_extension.html). In the CLI the loading
+of extension is enabled by default.
+
+A CDF file is opened by
+
+```
+CREATE VIRTUAL TABLE xy USING cdffile('Mission_Intstr_YYYYMMDDThhmmss');
 
 File `testcdfn.sql` is a script for the SQLite CLI `sqlite3`, with examples how to create
 a CDF files with zVariables and to insert records and attributes.

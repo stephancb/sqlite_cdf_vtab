@@ -105,7 +105,7 @@ static void cdf_rmext(char *z)
         z[n-4] = '\0';
 }
 
-static void cdf_prep_name(const char *argstr, char *name)
+static void cdf_parse_name(const char *argstr, char *name)
 {
     strncpy(name, argstr, CDF_PATHNAME_LEN+2);
     name[CDF_PATHNAME_LEN+2] = '\0';
@@ -116,13 +116,13 @@ static void cdf_prep_name(const char *argstr, char *name)
 
 static CDFstatus cdf_open(const char *argstr, char *name, CDFid *idp)
 {
-    cdf_prep_name(argstr, name);
+    cdf_parse_name(argstr, name);
     return CDFopenCDF(name,  idp);
 }
 
 static CDFstatus cdf_createfile(const char *argstr, char *name, CDFid *idp)
 {
-    cdf_prep_name(argstr, name);
+    cdf_parse_name(argstr, name);
     return CDFcreateCDF(name,  idp);
 }
 
@@ -254,6 +254,22 @@ static int cdf_valfuncid(long cdftype) {
 
 static char* typetext[] = {"ANY", "INTEGER", "REAL", "TEXT", "BLOB", "NULL"};
 
+/* Find the first zvar of type CDF_EPOCH: */
+static long cdf_find_epoch(CDFid id) {
+    CDFstatus status;
+    long kz,nzvars,datatype;
+
+    status = CDFgetNumzVars(id, &nzvars);
+    for( kz=0; kz<nzvars; kz++ ) {
+        status = CDFgetzVarDataType(id, kz, &datatype);
+        if( datatype==CDF_EPOCH )
+            break;
+    }
+    return ( kz<nzvars ) ? kz : -1;
+}
+
+#define CDF_MAX_NUM_SUBTABS 6
+
 typedef struct CdfFileVTab CdfFileVTab;
 struct CdfFileVTab {     /* Includes also sybtables which must be dropped when destructed: */
   CdfVTab      base;     /* Base class is the general CDFVtab */
@@ -283,6 +299,7 @@ static int cdfFileConnect(
     sqlite3_str *zsql = sqlite3_str_new(db);
     CdfFileVTab *filevtabp;
     char         name[CDF_PATHNAME_LEN+4],mstr[4],mode,submode;
+    long         kzepoch;
     int          rc;
 
     if( argc<4 ) {
@@ -346,7 +363,8 @@ static int cdfFileConnect(
     if( rc!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("Bad schema \n%s\nerror code: %d\n", z, rc);
         return SQLITE_ERROR;
-    }
+    } /* else
+        printf("FileConnect: file vtab declared\n"); */
     
     filevtabp = sqlite3_malloc( sizeof(*filevtabp) );
     if( filevtabp==0 )
@@ -364,7 +382,8 @@ static int cdfFileConnect(
     else
         submode = 't';
 
-    filevtabp->nsubtabs = 5;
+    filevtabp->nsubtabs = CDF_MAX_NUM_SUBTABS;
+
     filevtabp->submodes = sqlite3_malloc(filevtabp->nsubtabs*sizeof(char));
     if( filevtabp->submodes==0 )
         return SQLITE_NOMEM;
@@ -378,7 +397,9 @@ static int cdfFileConnect(
     if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_zvars!\n", argv[2]);
         return rc;
-    }
+    } /* else
+        printf("FileConnect: zvars vtab declared\n"); */
+
     filevtabp->submodes[0] = submode;
     filevtabp->names[0] = sqlite3_malloc(strlen(argv[2])+7);
     if( filevtabp->names[0]==0 )
@@ -430,16 +451,33 @@ static int cdfFileConnect(
     if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_attrzents!\n", argv[2]);
         return rc;
-    }
+    } /* else
+        printf("FileConnect: attrzentries vtab declared\n"); */
     filevtabp->submodes[4] = submode;
     filevtabp->names[4] = sqlite3_malloc(strlen(argv[2])+11);
     if( filevtabp->names[4]==0 )
         return SQLITE_NOMEM;
     stpcpy(stpcpy(filevtabp->names[4], argv[2]), "_attrzents");
 
+    if( (kzepoch=cdf_find_epoch(id))>=0 ) {
+        sqlite3_str_reset(zsql);
+        sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s_epochs USING cdfepochs('%d','%c','%d')",
+                argv[2], (long) id, 's', kzepoch);
+        if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
+            *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s_epochss!\n", argv[2]);
+            return rc;
+        } /* else
+            printf("FileConnect: epochs declared\n"); */
+        filevtabp->submodes[5] = submode;
+        filevtabp->names[5] = sqlite3_malloc(strlen(argv[2])+11);
+        if( filevtabp->names[5]==0 )
+            return SQLITE_NOMEM;
+        stpcpy(stpcpy(filevtabp->names[5], argv[2]), "_epochs");
+    }
+
     sqlite3_free(sqlite3_str_finish(zsql));
 
-    return rc;
+    return SQLITE_OK;
 }
 
 static int cdf_close(CdfVTab *pv){
@@ -637,24 +675,26 @@ struct CdfzVarsCursor {
     sqlite_int64 lastrow;           /* The last zvar, which the cursor should reach */
 };
 
-static int cdf_prep_idmode(
+/* The 4th argument is either the CDF file name (without extension "....cdf")
+ * or the CDFid of the opened file: */ 
+#define CDF_ARG_FILEID 3
+#define CDF_ARG_MODE 4
+#define CDF_ARG_EPOCH 5 
+
+/* Parse argument CDF_ARG_MODE which is supposed to indicate the mode: */
+static int cdf_parse_mode(
         int argc, const char *const*argv,
         char **pzErr,
-        CDFid *idp, char *modep
+        char *modep
 ){
-    CDFstatus   status;
-    char        name[CDF_PATHNAME_LEN+4],mstr[4];
+    char mstr[4];
 
-    if( argc<4 ) {
-        *pzErr = sqlite3_mprintf( "at least one arg is needed, must be the CDF file name!" );
-        return SQLITE_ERROR;
-    }
-    if( argc>4 ) {
-        if( strlen(argv[4])>3 ) {
+    if( argc>CDF_ARG_MODE ) {
+        if( strlen(argv[CDF_ARG_MODE])>3 ) {
             *pzErr = sqlite3_mprintf( "mode argument needs to be exactly one char!" );
             return SQLITE_ERROR;
         }
-        strncpy(mstr, argv[4], 4);
+        strncpy(mstr, argv[CDF_ARG_MODE], 4);
         cdf_dequote(mstr);
         *modep = mstr[0];
         if( strchr("rwst", *modep)==NULL ) {
@@ -664,12 +704,49 @@ static int cdf_prep_idmode(
     } else
         *modep = 'r';
 
+    return SQLITE_OK;
+}
+
+/* Parse argument CDF_ARG_MODE which is supposed to indicate the mode: */
+static int cdf_parse_epoch(
+        int argc, const char *const*argv,
+        char **pzErr,
+        long *zvar_epoch
+){
+    char estr[12],*endptr;
+    memset(estr, 0, 12);
+
+    if( strnlen(argv[CDF_ARG_EPOCH],12)>11 ) {
+        *pzErr = sqlite3_mprintf( "epoch col nr argument too long, must be <=15 chars!" );
+        return SQLITE_ERROR;
+    }
+    strncpy(estr, argv[CDF_ARG_EPOCH], 11);
+    *zvar_epoch = strtol(estr, &endptr, 0);
+
+    return SQLITE_OK;
+}
+
+static int cdf_parse_idmode(
+        int argc, const char *const*argv,
+        char **pzErr,
+        CDFid *idp, char *modep
+){
+    CDFstatus   status;
+    char        name[CDF_PATHNAME_LEN+4];
+    int         rc;
+
+    if( argc<4 ) {
+        *pzErr = sqlite3_mprintf( "at least one arg is needed, must be the CDF file name!" );
+        return SQLITE_ERROR;
+    }
+    rc = cdf_parse_mode(argc, argv, pzErr, modep);
+
     if( *modep=='r' || *modep=='w' ) {
-        if( strlen(argv[3])>CDF_PATHNAME_LEN+2 ) {
+        if( strlen(argv[CDF_ARG_FILEID])>CDF_PATHNAME_LEN+2 ) {
             *pzErr = sqlite3_mprintf( "CDF file name is too long!" );
             return SQLITE_ERROR;
         }
-        status = cdf_open(argv[3], name, idp);
+        status = cdf_open(argv[CDF_ARG_FILEID], name, idp);
         if( status!=CDF_OK ) {
             char statustext[CDF_STATUSTEXT_LEN+1];
             CDFgetStatusText(status, statustext);
@@ -677,7 +754,7 @@ static int cdf_prep_idmode(
             return SQLITE_CANTOPEN;
         }
     } else {
-        strncpy(name, argv[3], CDF_PATHNAME_LEN+2);
+        strncpy(name, argv[CDF_ARG_FILEID], CDF_PATHNAME_LEN+2);
         name[CDF_PATHNAME_LEN+2] = '\0';
         cdf_dequote(name);
         *idp = (CDFid) atol(name);
@@ -685,23 +762,26 @@ static int cdf_prep_idmode(
     return SQLITE_OK;
 }
 
+static int cdf_declare_vtab(sqlite3 *db, sqlite3_str *zsql, char **pzErr) {
+    char  *z = sqlite3_str_value(zsql);
+    int   rc = sqlite3_declare_vtab(db, z);
+    if( rc!=SQLITE_OK )
+        *pzErr = sqlite3_mprintf("Bad schema \n%s\nerror code: %d\n", z, rc);
+    sqlite3_free(sqlite3_str_finish(zsql));
+
+    return rc;
+}
+
 static int cdf_createvtab(sqlite3 *db, sqlite3_str *zsql, CDFid id, char mode, const char *name,
         char **pzErr, sqlite3_vtab **ppVtab)
 {
-    char    *z = sqlite3_str_value(zsql);
     int      rc;
     CdfVTab *vtabp = 0;
 
-    rc = sqlite3_declare_vtab(db, z);
-    if( rc!=SQLITE_OK ) {
-        *pzErr = sqlite3_mprintf("Bad schema \n%s\nerror code: %d\n", z, rc);
-        sqlite3_free(sqlite3_str_finish(zsql));
-        return SQLITE_ERROR;
-    }
-    sqlite3_free(sqlite3_str_finish(zsql));
+    if( (rc = cdf_declare_vtab(db, zsql, pzErr))!=SQLITE_OK )
+        return rc;
 
     vtabp = sqlite3_malloc( sizeof(CdfVTab) );
-    *ppVtab = (sqlite3_vtab*) vtabp;
     if( vtabp==0 ) return SQLITE_NOMEM;
     memset(vtabp, 0, sizeof(CdfVTab));
 
@@ -710,6 +790,8 @@ static int cdf_createvtab(sqlite3 *db, sqlite3_str *zsql, CDFid id, char mode, c
     vtabp->db   = db;
     vtabp->name = sqlite3_malloc( strlen(name)+1 );
     stpcpy(vtabp->name, name);
+
+    *ppVtab = (sqlite3_vtab*) vtabp;
 
     return rc;
 }
@@ -726,7 +808,7 @@ static int cdfzVarsConnect(
     sqlite3_str   *zsql = sqlite3_str_new(db);
     int            rc;
 
-    rc = cdf_prep_idmode(argc, argv, pzErr, &id, &mode);
+    rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode);
     if( rc!=SQLITE_OK ) return rc;
 
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_zvars_ignored (\n");
@@ -1448,7 +1530,7 @@ static int cdfzRecsConnect(
     int             *sqltypes,*valtypes;
     int              rc;
 
-    rc = cdf_prep_idmode(argc, argv, pzErr, &id, &mode);
+    rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode);
     if( rc!=SQLITE_OK ) return rc;
 
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_recs_ignored (\n");
@@ -1717,7 +1799,6 @@ static int cdfzRecsColumn(
     CdfzVarsRecCursor *cp = (CdfzVarsRecCursor*) curp;
     CdfzVarsRecords   *vp = (CdfzVarsRecords*) curp->pVtab;
     CDFstatus status = CDF_OK;
-    CDFid id;
     int sqltype;
 
     sqlite_int64 n;
@@ -1735,9 +1816,8 @@ static int cdfzRecsColumn(
     if( iCol==0 )
         sqlite3_result_int64(ctx, cp->recid);
     else if( iCol>0 && iCol<=vp->nzvars) { 
-        id      = cp->id;
         sqltype = vp->sqltypes[iCol-1];
-        status  = (*res[sqltype-1])(ctx, id, (long) iCol, cp->recid, vp->nbytes[iCol-1]);
+        status  = (*res[sqltype-1])(ctx, cp->id, (long) iCol, cp->recid, vp->nbytes[iCol-1]);
         if( status<CDF_OK ) {
             char statustext[CDF_STATUSTEXT_LEN+1];
             CDFgetStatusText(status, statustext);
@@ -1996,7 +2076,7 @@ static int cdfAttrsConnect(
     sqlite3_str   *zsql = sqlite3_str_new(db);
     int            rc;
 
-    rc = cdf_prep_idmode(argc, argv, pzErr, &id, &mode);
+    rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode);
     if( rc!=SQLITE_OK ) return rc;
 
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_gattrs_ignored (\n");
@@ -2193,7 +2273,7 @@ static int cdfAttrgEntriesConnect(
     CdfAttrEntries *vtabp = 0;
     int              rc;
 
-    rc = cdf_prep_idmode(argc, argv, pzErr, &id, &mode);
+    rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode);
     if( rc!=SQLITE_OK ) return rc;
 
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_attr_gentries_ignored (\n");
@@ -2821,7 +2901,7 @@ static int cdfAttrzEntriesConnect(
     CdfAttrEntries *vtabp = 0;
     int              rc;
 
-    rc = cdf_prep_idmode(argc, argv, pzErr, &id, &mode);
+    rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode);
     if( rc!=SQLITE_OK ) return rc;
 
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_attr_zentries_ignored (\n");
@@ -3275,6 +3355,280 @@ static sqlite3_module CdfAttrzEntriesModule = {
   0,                           /* xRename */
 }; /**/
 
+/* Module CdfEpochs */
+
+#include "doy.c"
+
+typedef struct CdfEpochsVTab CdfEpochsVTab;
+struct CdfEpochsVTab {
+    CdfVTab      cdfvtp;            /* Parent class.  Must be first */
+    long         kzepoch;           /* zVar number with datatype CDF_EPOCH */
+};
+typedef struct CdfEpochsCursor CdfEpochsCursor;
+struct CdfEpochsCursor {
+    sqlite3_vtab_cursor basecur;     /* Base class.  Must be first */
+    CDFid               id;          /* CDF file identifier. */
+    long                kzepoch;     /* zVar number with datatype CDF_EPOCH */
+    sqlite_int64        recid;       /* rowid */
+    double              epoch;
+    long                year;
+    long                month;
+    long                day;
+    long                hour;
+    long                minute;
+    long                second;
+    long                msec;
+};
+
+static int cdfEpochsConnect(
+        sqlite3 *db,
+        void *pAux,
+        int argc, const char *const*argv,
+        sqlite3_vtab **ppVtab,
+        char **pzErr)
+{
+    CDFid          id;
+    char           mode;
+    sqlite3_str   *zsql = sqlite3_str_new(db);
+    CdfEpochsVTab *vtabp = 0;
+    long           kzepoch;
+    int            rc;
+
+    if( (rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode))!=SQLITE_OK )
+        return rc;
+
+    if( mode!='r' && mode!='s' ) {
+        *pzErr = sqlite3_mprintf("Virtual table Epochs must be read only");
+        return SQLITE_ERROR;
+    }
+
+    if( argc>CDF_ARG_EPOCH )
+        rc = cdf_parse_epoch(argc, argv, pzErr, &kzepoch);
+    else
+        kzepoch = cdf_find_epoch(id);
+    if( kzepoch<0 ) {
+        char name[CDF_PATHNAME_LEN];
+        CDFstatus status=CDFgetName(id, name);
+        *pzErr = sqlite3_mprintf("No zVar with datatype=CDF_EPOCH in %s", name);
+        return SQLITE_ERROR;
+    }
+
+    sqlite3_str_appendf(zsql, "CREATE TABLE cdf_epochs_ignored (\n");
+    sqlite3_str_appendf(zsql, "    id INTEGER PRIMARY KEY NOT NULL,\n");
+    sqlite3_str_appendf(zsql, "    Epoch  REAL,\n");
+    sqlite3_str_appendf(zsql, "    year   INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    month  INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    day    INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    doy    INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    hour   INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    minute INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    second INTEGER,\n");
+    sqlite3_str_appendf(zsql, "    msec   INTEGER\n");
+    sqlite3_str_appendf(zsql, ");\n");
+
+    if( (rc = cdf_declare_vtab(db, zsql, pzErr))!=SQLITE_OK )
+        return rc;
+
+    vtabp = sqlite3_malloc( sizeof(*vtabp) );
+    if( vtabp==0 ) return SQLITE_NOMEM;
+    *ppVtab = (sqlite3_vtab*) vtabp;
+    memset(vtabp, 0, sizeof(*vtabp));
+
+    vtabp->cdfvtp.id   = id;
+    vtabp->cdfvtp.mode = mode;
+    vtabp->cdfvtp.db   = db;
+    vtabp->cdfvtp.name = sqlite3_malloc( strlen(argv[2])+1 );
+    stpcpy(vtabp->cdfvtp.name, argv[2]);
+    vtabp->kzepoch = kzepoch;
+
+    return rc;
+}
+
+static int cdfEpochsDisconnect(sqlite3_vtab *pvtab){
+    CdfEpochsVTab *pv = (CdfEpochsVTab*) pvtab;
+    int rc = cdf_close(&pv->cdfvtp);
+    sqlite3_free(pv->cdfvtp.name);
+    sqlite3_free(pv);
+
+    return rc;
+}
+
+/*
+** The xConnect and xCreate methods do the same thing, but they must be
+** different so that the virtual table is not an eponymous virtual table.
+*/
+static int cdfEpochsCreate(
+        sqlite3 *db,
+        void *pAux,
+        int argc, const char *const*argv,
+        sqlite3_vtab **ppVtab,
+        char **pzErr)
+{
+    return cdfEpochsConnect(db, pAux, argc, argv, ppVtab, pzErr);
+}
+
+static int cdfEpochsOpen(
+        sqlite3_vtab* vtabp,
+        sqlite3_vtab_cursor** ppcur
+){
+    long nzvars;
+    CDFstatus status;
+    CdfEpochsVTab *vp = (CdfEpochsVTab*) vtabp;
+    CdfEpochsCursor *cp = sqlite3_malloc64(sizeof(CdfEpochsCursor));
+    if( cp==0 ) return SQLITE_NOMEM;
+
+    cp->id      = vp->cdfvtp.id;
+    cp->kzepoch = vp->kzepoch;
+    cp->recid   = 1;
+
+    *ppcur = (sqlite3_vtab_cursor*) cp;
+
+    return SQLITE_OK;
+}
+static int cdfEpochsClose(sqlite3_vtab_cursor *curp)
+{
+    CdfEpochsCursor *cp = (CdfEpochsCursor*) curp; 
+    sqlite3_free(cp);
+
+    return SQLITE_OK;
+}
+
+static int cdfEpochsBestIndex(
+        sqlite3_vtab *vtabp,
+        sqlite3_index_info *idxinfop
+){
+    CdfEpochsVTab *vp = (CdfEpochsVTab*) vtabp;
+    CDFstatus status;
+    long maxrec;
+
+    status = CDFgetzVarMaxWrittenRecNum(vp->cdfvtp.id, vp->kzepoch, &maxrec);
+    idxinfop->idxNum = 1;
+    idxinfop->idxStr = "";
+    idxinfop->estimatedCost = maxrec;
+    return ( status==CDF_OK ) ? SQLITE_OK : SQLITE_ERROR;
+}
+
+static int cdfEpochsRowid(sqlite3_vtab_cursor *cp, sqlite_int64 *prowid) {
+    *prowid = ((CdfEpochsCursor*) cp)->recid;
+    return SQLITE_OK;
+}
+
+static CDFstatus cdf_update_epoch(CdfEpochsCursor *cp) {
+    CDFstatus status;
+    long maxepochrec;
+    
+    status = CDFgetzVarMaxWrittenRecNum(cp->id, cp->kzepoch, &maxepochrec);
+    if( cp->recid <= maxepochrec+1 ) {
+        cdf_seqpos(cp->id, cp->kzepoch, cp->recid-1);
+        status = CDFgetzVarSeqData(cp->id, cp->kzepoch, &cp->epoch);
+        /* status = CDFgetzVarRecordData(cp->id, cp->kzepoch, cp->recid-1, &epoch); */
+        EPOCHbreakdown(cp->epoch, &cp->year, &cp->month, &cp->day, &cp->hour, &cp->minute, &cp->second, &cp->msec);
+    }
+    return status;
+}
+
+static int cdfEpochsFilter(
+        sqlite3_vtab_cursor *curp, 
+        int idxNum, const char *idxStr,
+        int argc, sqlite3_value **argv
+){
+    CdfEpochsCursor *cp = (CdfEpochsCursor*) curp; 
+    ((CdfEpochsCursor*) cp)->recid = 1;
+
+    cdf_update_epoch(cp);
+    
+    return SQLITE_OK;
+}
+
+static int cdfEpochsEof(sqlite3_vtab_cursor *curp){
+    CdfEpochsCursor *cp = (CdfEpochsCursor*) curp;
+    CDFstatus status;
+    long maxepochrec;
+
+    status = CDFgetzVarMaxWrittenRecNum(cp->id, cp->kzepoch, &maxepochrec);
+
+    return cp->recid > maxepochrec+1;
+}
+
+static int cdfEpochsNext(sqlite3_vtab_cursor *curp) {
+    CdfEpochsCursor *cp = (CdfEpochsCursor*) curp;
+    cp->recid++;
+    cdf_update_epoch(cp);
+    
+    return SQLITE_OK;
+}
+
+static int cdfEpochsColumn(
+        sqlite3_vtab_cursor *curp,  /* The cursor */
+        sqlite3_context *ctx,       /* First argument to sqlite3_result_...() */
+        int iCol
+){
+    CdfEpochsCursor *cp = (CdfEpochsCursor*) curp;
+
+    char **pzErr = &cp->basecur.pVtab->zErrMsg;
+
+    /* return immediately if called by cdfUpdate and the column is unchanged*/
+    if( sqlite3_vtab_nochange(ctx) )
+        return SQLITE_OK;
+
+    switch( iCol ) {
+        case 0:
+            sqlite3_result_int64(ctx, cp->recid);
+            return SQLITE_OK;
+        case 1:
+            sqlite3_result_double(ctx, cp->epoch);
+            return SQLITE_OK;
+        case 2:
+            sqlite3_result_int(ctx, cp->year);
+            return SQLITE_OK;
+        case 3:
+            sqlite3_result_int(ctx, cp->month);
+            return SQLITE_OK;
+        case 4:
+            sqlite3_result_int(ctx, cp->day);
+            return SQLITE_OK;
+        case 5:
+            sqlite3_result_int(ctx, doy(cp->year, cp->month, cp->day));
+            return SQLITE_OK;
+        case 6:
+            sqlite3_result_int(ctx, cp->hour);
+            return SQLITE_OK;
+        case 7:
+            sqlite3_result_int(ctx, cp->minute);
+            SQLITE_OK;
+        case 8:
+            sqlite3_result_int(ctx, cp->second);
+            return SQLITE_OK;
+        case 9:
+            sqlite3_result_int(ctx, cp->msec);
+            return SQLITE_OK;
+        default:
+            return SQLITE_ERROR;
+    }
+}
+
+static sqlite3_module CdfEpochsModule = {
+  0,                     /* iVersion */
+  cdfEpochsCreate,       /* xCreate */
+  cdfEpochsConnect,      /* xConnect */
+  cdfEpochsBestIndex,    /* xBestIndex */
+  cdfEpochsDisconnect,   /* xDisconnect */
+  cdfEpochsDisconnect,   /* xDestroy */
+  cdfEpochsOpen,         /* xOpen - open a cursor */
+  cdfEpochsClose,        /* xClose - close a cursor */
+  cdfEpochsFilter,       /* xFilter - configure scan constraints */
+  cdfEpochsNext,         /* xNext - advance a cursor */
+  cdfEpochsEof,          /* xEof - check for end of scan */
+  cdfEpochsColumn,       /* xColumn - read data */
+  cdfEpochsRowid,        /* xRowid - read data */
+  0,   /* xUpdate, 0 for read only */
+  0,   /* xBegin */
+  0,   /* xSync */
+  0,   /* xCommit */
+  0,   /* xRollback */
+  0,   /* xFindMethod */
+  0,   /* xRename */
+}; /**/
 
 static void cdfEpoch( sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     long hour=0,minute=0,second=0,millisec=0;
@@ -3338,6 +3692,9 @@ int sqlite3_cdf_init(
   if( rc!=SQLITE_OK ) return rc;
   
   rc = sqlite3_create_module(db, "cdfattrzentries", &CdfAttrzEntriesModule, 0);
+  if( rc!=SQLITE_OK ) return rc;
+  
+  rc = sqlite3_create_module(db, "cdfepochs", &CdfEpochsModule, 0);
   if( rc!=SQLITE_OK ) return rc;
 
   rc = sqlite3_create_function(
