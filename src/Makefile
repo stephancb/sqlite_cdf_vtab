@@ -6,7 +6,7 @@ sqlite_extpath=$(HOME)/code/sqlite/extensions
 
 libcdfpath=$(cdfprefix)/cdf/lib
 
-CC=gcc -O2
+CC=gcc -g -O2
 
 cdf.so: cdf.c
 	$(CC) -L$(libcdfpath) -lcdf -fPIC -shared cdf.c -o cdf.so
