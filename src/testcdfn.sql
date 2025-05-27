@@ -31,11 +31,16 @@ SELECT printf('Table t2:');
 .mode box
 SELECT * FROM pragma_table_info('t2');
 SELECT * FROM t2;
-.mode list
-SELECT printf('');
+-- .mode list
+-- SELECT printf('');
+-- SELECT printf('.schema t2');
+-- .schema t2
+-- SELECT printf('.schema t2_zrecs');
+-- .schema t2_zrecs
 
 -- insert zvariables:
 .mode list
+SELECT printf('');
 SELECT printf('Table t2_zvars:');
 .mode box
 SELECT * FROM pragma_table_info('t2_zvars');
@@ -72,6 +77,9 @@ SELECT * FROM pragma_table_info('t2_zrecs');
 .mode list
 SELECT printf('Inserting record ''Uppsala'', 59.838, 17.648, 38:');
 INSERT INTO t2_zrecs VALUES(NULL, 'Uppsala', 59.838, 17.648, 38, float32(17.0, 22.0));
+.mode box
+SELECT * FROM t2_zrecs;
+.mode list
 SELECT printf('Inserting record ''Kiruna'', 67.87, 20.43, 418:');
 INSERT INTO t2_zrecs VALUES(NULL, 'Kiruna', 67.87, 20.43, 418, NULL);
 SELECT printf('Inserting record ''Lund C'', 55.71, 13.19, 43:');
@@ -177,3 +185,27 @@ SELECT printf('');
 SELECT printf('cdfEpoch(..) extension function');
 .mode box
 SELECT cdfEpoch(2023, 8, 12, 3, 52, 4);
+.mode list
+SELECT printf('dropping table t2');
+DROP TABLE t2;
+SELECT printf('Virtual table t2 dropped. The following tables exist:');
+.mode box
+SELECT name FROM sqlite_schema WHERE type='table';
+.mode list
+SELECT printf('Opening virtual cdf read only:');
+SELECT printf('CREATE VIRTUAL TABLE t2 USING cdffile(''./testzvars2'', ''r'');');
+CREATE VIRTUAL TABLE t2 USING cdffile('./testzvars2', 'r');
+SELECT printf('Virtual table t2: the following tables exist:');
+.mode box
+SELECT name FROM sqlite_schema WHERE type='table';
+.mode list
+SELECT printf('');
+SELECT printf('Table t2_zvars:');
+.mode box
+SELECT * FROM t2_zvars;
+.mode list
+SELECT printf('Get all records');
+.mode box
+SELECT * FROM t2_zread;
+.mode list
+

@@ -1,5 +1,5 @@
 /*
-** 2023-08-30
+** 2025-04-11
 **
 ** The author disclaims copyright to this source code.  In place of
 ** a legal notice, here is a blessing:
@@ -18,12 +18,10 @@
 **    CREATE VIRTUAL TABLE l1blp USING cdffile('SW_OPER_EFIC_LP_1B_20200502T000000_20200502T235959_0502_MDR_EFI_LP');
 **    SELECT * FROM l1blp_zvars;
 */
-#if !defined(SQLITEINT_H)
+#if !defined(SQLITE3INT_H)
 #include "sqlite3ext.h"
 #endif
 SQLITE_EXTENSION_INIT1
-
-/* #define PADISNULL */
 
 #include <assert.h>
 #include <string.h>
@@ -282,7 +280,7 @@ struct CdfFileVTab {     /* Includes also sybtables which must be dropped when d
   char**       names;    /* names of the virtual subtabs */
 };
 
-#define CDF_MAX_NUM_SUBTABS 8
+#define CDF_MAX_NUM_SUBTABS 9
 
 static int cdf_add_subtab(
         sqlite3 *db, CdfFileVTab *vtp, char submode, const char *mnnm,
@@ -294,6 +292,7 @@ static int cdf_add_subtab(
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s%s USING cdf%s('%d','%c')",
             mnnm, subnm, modnm, id, submode);
+
     if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s%s\n", mnnm, subnm);
         return rc;
@@ -438,8 +437,13 @@ static int cdfFileConnect(
     rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zvars", (long) id, "_zvars", pzErr);
     if( rc!=SQLITE_OK ) goto exitlabel;
 
-    rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zrecs", (long) id, "_zrecs", pzErr);
-    if( rc!=SQLITE_OK ) goto exitlabel;
+    if( mode=='r' ) {
+        rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zread", (long) id, "_zread", pzErr);
+        if( rc!=SQLITE_OK ) goto exitlabel;
+    } else {
+        rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zrecs", (long) id, "_zrecs", pzErr);
+        if( rc!=SQLITE_OK ) goto exitlabel;
+    }
 
     rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "attrs", (long) id, "_attrs", pzErr);
     if( rc!=SQLITE_OK ) goto exitlabel;
@@ -492,9 +496,9 @@ static int cdfFileDisconnect(sqlite3_vtab *pvtab){
 
         /* printf("FileDisconnect: dropping tabele '%s'\n", sqlite3_str_value(zsql)); */
         /* This fails with rc=1 for some subtables, don't know why. It seems harmless */
-        if( (rc = sqlite3_exec(fvp->base.db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
+        /* if( (rc = sqlite3_exec(fvp->base.db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
             printf("FileDisconnect: dropping table '%s' failed, rc = %d\n", fvp->names[kt], rc);
-        } /* else
+        }  else
             printf("FileDisconnect: table %s dropped, rc = %d\n", fvp->names[kt], rc);
             */
         rc = sqlite3_exec(fvp->base.db, sqlite3_str_value(zsql), NULL, NULL, NULL);
@@ -1491,13 +1495,12 @@ struct CdfzVarsRecords {
     int*         valtypes;          /* Function id to convert SQLite value to CDF variable */
 };
 
-/* A cursor for the CDF zVars virtual table */
-/* typedef struct CdfVTabCursor CdfzVarsRecCursor; */
-typedef struct CdfzVarsRecCursor CdfzVarsRecCursor;
-struct CdfzVarsRecCursor {
+/* A read/write cursor for CDF zVars (mapped ot a table of records): */
+typedef struct CdfzRecordsCursor CdfzRecordsCursor;
+struct CdfzRecordsCursor {
     sqlite3_vtab_cursor basecur;     /* Base class.  Must be first */
     CDFid               id;          /* CDF file identifier. */
-    sqlite_int64        recid;       /* rowid */
+    sqlite_int64        recid;       /* rowid, starting with 1 */
     /* long* maxwritten;                /* Max written record number for each zvar. */
 };
 
@@ -1532,6 +1535,7 @@ static int cdfzRecsConnect(
         *pzErr = sqlite3_mprintf("CDFgetNumzVars failed,\n%s", statustext);
         return SQLITE_ERROR;
     }
+
     nbytes   = sqlite3_malloc64(nzvars*sizeof(long));
     sqltypes = sqlite3_malloc64(nzvars*sizeof(int));
     valtypes = sqlite3_malloc64(nzvars*sizeof(int));
@@ -1615,6 +1619,13 @@ static int cdfzRecsBestIndex(
     long kzvar;
     long maxrec;
 
+    if( idxinfop->nConstraint>0 ) {
+        for( int k=0; k<idxinfop->nConstraint; k++ )
+            printf("  k=%d,  iCol = %d, op = %d, usb = %d\n",
+                    idxinfop->aConstraint[k].iColumn, idxinfop->aConstraint[k].op,
+                    idxinfop->aConstraint[k].usable);
+    }
+
     if( idxinfop->nConstraint>0 )
         kzvar = idxinfop->aConstraint[0].iColumn;
     else
@@ -1627,7 +1638,7 @@ static int cdfzRecsBestIndex(
 }
 
 /*
-** Constructor for a new CdfzVarsRecords cursor object.
+** Constructor of a read/write cursor for records of Cdf zVars.
 */
 static int cdfzRecsOpen(
         sqlite3_vtab* vtabp,
@@ -1636,7 +1647,7 @@ static int cdfzRecsOpen(
     /* long nzvars; */
     CDFstatus status;
     CdfzVarsRecords   *vp = (CdfzVarsRecords*) vtabp;
-    CdfzVarsRecCursor *cp = sqlite3_malloc64(sizeof(CdfzVarsRecCursor));
+    CdfzRecordsCursor *cp = sqlite3_malloc64(sizeof(CdfzRecordsCursor));
     if( cp==0 ) return SQLITE_NOMEM;
 
     cp->id    = vp->cdfvtp.id;
@@ -1659,7 +1670,7 @@ static int cdfzRecsOpen(
 */
 static int cdfzRecsClose(sqlite3_vtab_cursor *curp)
 {
-    CdfzVarsRecCursor *cp = (CdfzVarsRecCursor*) curp; 
+    CdfzRecordsCursor *cp = (CdfzRecordsCursor*) curp; 
     /* sqlite3_free(cp->maxwritten); */
     sqlite3_free(cp);
     /* printf("zRecsCursor closed\n"); */
@@ -1676,7 +1687,13 @@ static int cdfzRecsFilter(
         int idxNum, const char *idxStr,
         int argc, sqlite3_value **argv
 ){
-    ((CdfzVarsRecCursor*) cp)->recid = 1;
+    ((CdfzRecordsCursor*) cp)->recid = 1;
+    return SQLITE_OK;
+}
+static int cdfzRecsNext(
+    sqlite3_vtab_cursor *cp
+){
+    ((CdfzRecordsCursor*) cp)->recid += 1;
     return SQLITE_OK;
 }
 
@@ -1684,13 +1701,16 @@ static int cdfzRecsFilter(
 ** Return TRUE if the cursor has been moved beyond the maximum written record nr across all zVars
 */
 static int cdfzRecsEof(sqlite3_vtab_cursor *curp){
-    CdfzVarsRecCursor *cp = (CdfzVarsRecCursor*) curp;
-    CDFstatus status;
+    CdfzRecordsCursor *cp = (CdfzRecordsCursor*) curp;
     long zvarsmaxw;
 
-    status = CDFgetzVarsMaxWrittenRecNum(cp->id, &zvarsmaxw);
+    CDFstatus status = CDFgetzVarsMaxWrittenRecNum(cp->id, &zvarsmaxw);
 
     return cp->recid > zvarsmaxw+1;
+}
+static int cdfzRecsRowid(sqlite3_vtab_cursor *cp, sqlite_int64 *rowidp) {
+    *rowidp = ((CdfzRecordsCursor*) cp)->recid;
+    return SQLITE_OK;
 }
 
 /* Check whether the sequence position is ok, change if needed */
@@ -1795,7 +1815,7 @@ static int cdfzRecsColumn(
         sqlite3_context *ctx,       /* First argument to sqlite3_result_...() */
         int iCol
 ){
-    CdfzVarsRecCursor *cp = (CdfzVarsRecCursor*) curp;
+    CdfzRecordsCursor *cp = (CdfzRecordsCursor*) curp;
     CdfzVarsRecords   *vp = (CdfzVarsRecords*) curp->pVtab;
     CDFstatus status = CDF_OK;
     int sqltype;
@@ -2030,7 +2050,7 @@ static int cdfzRecsCreate(
     return cdfzRecsConnect(db, pAux, argc, argv, ppVtab, pzErr);
 }
 
-static sqlite3_module CdfRecsModule = {
+static sqlite3_module CdfzRecsModule = {
   0,                      /* iVersion */
   cdfzRecsCreate,         /* xCreate */
   cdfzRecsConnect,        /* xConnect */
@@ -2040,10 +2060,10 @@ static sqlite3_module CdfRecsModule = {
   cdfzRecsOpen,           /* xOpen - open a cursor */
   cdfzRecsClose,          /* xClose - close a cursor */
   cdfzRecsFilter,         /* xFilter - configure scan constraints */
-  cdfVTabNext,            /* xNext - advance a cursor */
+  cdfzRecsNext,           /* xNext - advance a cursor */
   cdfzRecsEof,            /* xEof - check for end of scan */
   cdfzRecsColumn,         /* xColumn - read data */
-  cdfVTabRowid,           /* xRowid - read data */
+  cdfzRecsRowid,          /* xRowid - current rowid */
   cdfzRecsUpdate,         /* xUpdate - insert, update, delete CDF records */
   0,                      /* xBegin */
   0,                      /* xSync */
@@ -2053,16 +2073,25 @@ static sqlite3_module CdfRecsModule = {
   0,                      /* xRename */
 };
 
-/* Module CdfzRead using the "simplified CDFread functions", section 6.15 of the CRM */
+/* Module CdfzRead using the "simplified CDFread functions", section 6.5 of the CRM */
+
+typedef void (*cdf2sqlfun)(sqlite3_context*, CDFdata, long, long);
 
 typedef struct CdfzVarsRead CdfzVarsRead;
 struct CdfzVarsRead {
     CdfVTab      cdfvtp;            /* Parent class.  Must be first */
 
     long         nzvars;            /* Nr of zVars. */
-    int*         sqltypes;          /* SQL type to which the CDF zVar is converted. */
-    int*         valtypes;          /* Function id to convert SQLite value to CDF variable */
-    long*        nrecs;             /* Nr of records */
+    cdf2sqlfun  *cdf2sql;
+                                    /* Function ids to get CDF zvar value in rec and convert to SQLite result */
+    int         *sqltypes;          /* Corresponding SQLite types */
+    long        *nbytes;            /* Nr of bytes of each element */
+    long        *nelems;            /* Nr of elements (bytes), only relevant for strings */
+    long        *ndims;             /* zVars nr of dimensions, 0=scalar, 1=vector, ... */
+    long       **dimszs;            /* zVars dimension sizes */
+    long        *recvars;           /* Record variances, VAR=-1: each record has a value, NOVAR=0: one record */
+    long       **dimvars;           /* Record variances for each dimension */
+    long        *nrecs;             /* Nr of records */
     CDFdata*     zdatap;            /* Pointers to CDF buffer, NULL if not yet read*/
 };
 
@@ -2078,11 +2107,13 @@ static int cdfzReadConnect(
     char             mode,varName[CDF_VAR_NAME_LEN256+4],*z;
     sqlite3_str     *zsql = sqlite3_str_new(db);
     CdfzVarsRead    *vtabp = 0;
-    long             k,kzvar,nzvars,*nrecsp;
+    long             k,kzvar,nzvars,*nrecs;
     long             dimsizes[CDF_MAX_DIMS];
     long             cdftype,sqlitetype,numdims,kdim,nelem;
+    long            *nbytes,*nelems,*ndims,**dimszs,*recvars,**dimvars;
     void           **zdatap;
-    int             *sqltypes,*valtypes;
+    cdf2sqlfun      *cdf2sql;
+    int             *sqltypes;
     int              rc;
 
     rc = cdf_parse_idmode(argc, argv, pzErr, &id, &mode);
@@ -2093,9 +2124,6 @@ static int cdfzReadConnect(
         return SQLITE_READONLY;
     }
 
-    sqlite3_str_appendf(zsql, "CREATE TABLE cdf_read_ignored (\n");
-    sqlite3_str_appendf(zsql, "    id INTEGER PRIMARY KEY NOT NULL");
-
     status = CDFgetNumzVars(id, &nzvars);
     if( status!=CDF_OK ) {
         char statustext[CDF_STATUSTEXT_LEN+1];
@@ -2103,14 +2131,29 @@ static int cdfzReadConnect(
         *pzErr = sqlite3_mprintf("CDFgetNumzVars failed,\n%s", statustext);
         return SQLITE_ERROR;
     }
+
+    if( nzvars==0 ) {
+        *ppVtab = NULL;
+
+        return rc;
+    }
+
+    sqlite3_str_appendf(zsql, "CREATE TABLE cdf_read_ignored (\n");
+    sqlite3_str_appendf(zsql, "    id INTEGER PRIMARY KEY NOT NULL");
+
     sqltypes = sqlite3_malloc64(nzvars*sizeof(int));
-    valtypes = sqlite3_malloc64(nzvars*sizeof(int));
-    nrecsp   = sqlite3_malloc64(nzvars*sizeof(long));
+    cdf2sql  = sqlite3_malloc64(nzvars*sizeof(cdf2sqlfun));
+    nbytes   = sqlite3_malloc64(nzvars*sizeof(long));
+    nelems   = sqlite3_malloc64(nzvars*sizeof(long));
+    ndims    = sqlite3_malloc64(nzvars*sizeof(long));
+    nrecs    = sqlite3_malloc64(nzvars*sizeof(long));
+    dimszs   = sqlite3_malloc64(nzvars*sizeof(long*));
+    recvars  = sqlite3_malloc64(nzvars*sizeof(long));
+    dimvars  = sqlite3_malloc64(nzvars*sizeof(long*));
     zdatap   = sqlite3_malloc64(nzvars*sizeof(CDFdata));
 
     for( kzvar=0; kzvar<nzvars; kzvar++ ) {
-        for( k=0; k<CDF_VAR_NAME_LEN256+4; k++ )
-            varName[k] = '\0';
+        memset(varName, '\0', CDF_VAR_NAME_LEN256+4);
 
         status = CDFgetzVarName(id, kzvar, varName);
         status = CDFgetzVarDataType(id, kzvar, &cdftype);
@@ -2121,6 +2164,7 @@ static int cdfzReadConnect(
             sqlitetype = cdf_sqlitetype(cdftype);
             sqltypes[kzvar] = sqlitetype;
             sqlite3_str_appendf(zsql, "    \"%s\" %s", varName, typetext[sqlitetype]);
+            nbytes[kzvar] = cdf_elsize(cdftype);
         } else {
             status = CDFgetzVarDimSizes (id, kzvar, dimsizes);
             nelem = 1;
@@ -2128,15 +2172,26 @@ static int cdfzReadConnect(
                 nelem *= dimsizes[kdim];
 
             sqlite3_str_appendf(zsql, "    \"%s\" BLOB", varName);
-            sqltypes[kzvar] = SQLITE_BLOB;   
+            sqltypes[kzvar] = SQLITE_BLOB;
+            nbytes[kzvar]   = cdf_elsize(cdftype)*nelem;
         }
-        valtypes[kzvar] = cdf_valfuncid(cdftype);
-        nrecsp[kzvar]   = 0;
+
+        sqltypes[kzvar] = 0;
+        cdf2sql[kzvar]  = NULL;
+        nelems[kzvar]   = 0;
+        ndims[kzvar]    = 0;
+        dimszs[kzvar]   = NULL;
+        recvars[kzvar]  = 0;
+        dimvars[kzvar]  = NULL;
+        nrecs[kzvar]    = 0;
         zdatap[kzvar]   = NULL;
     }
     sqlite3_str_appendf(zsql, "\n);");
 
     z = sqlite3_str_value(zsql);
+
+    printf("z = \n%s\n", z);
+
     rc = sqlite3_declare_vtab(db, z);
     if( rc!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("Bad schema \n%s\nerror code: %d\n", z, rc);
@@ -2148,44 +2203,231 @@ static int cdfzReadConnect(
     if( vtabp==0 ) return SQLITE_NOMEM;
     memset(vtabp, 0, sizeof(*vtabp));
 
+    vtabp->cdfvtp.name = sqlite3_malloc64(strlen(argv[2]) + 1);
+    stpcpy(vtabp->cdfvtp.name, argv[2]);
     vtabp->cdfvtp.id   = id;
     vtabp->cdfvtp.mode = mode;
     vtabp->cdfvtp.db   = db;
-    vtabp->cdfvtp.name = sqlite3_malloc( strlen(argv[2])+1 );
-    stpcpy(vtabp->cdfvtp.name, argv[2]);
-    vtabp->nzvars = nzvars;
-    vtabp->sqltypes = sqltypes;
-    vtabp->valtypes = valtypes;
-    vtabp->nrecs    = nrecsp;
-    vtabp->zdatap   = zdatap;
+    vtabp->nzvars      = nzvars;
+    vtabp->sqltypes    = sqltypes;
+    vtabp->cdf2sql     = cdf2sql;
+    vtabp->nbytes      = nbytes;
+    vtabp->nelems      = nelems;
+    vtabp->ndims       = ndims;
+    vtabp->dimszs      = dimszs;
+    vtabp->recvars     = recvars;
+    vtabp->dimvars     = dimvars;
+    vtabp->nrecs       = nrecs;
+    vtabp->zdatap      = zdatap;
 
     *ppVtab = (sqlite3_vtab*) vtabp;
 
     return rc;
 }
+
 /*
-** This method is the destructor of a CdfzVarsRecords object.
+** The xConnect and xCreate methods do the same thing, but they must be
+** different so that the virtual table is not an eponymous virtual table.
+*/
+static int cdfzReadCreate(
+        sqlite3 *db,
+        void *pAux,
+        int argc, const char *const*argv,
+        sqlite3_vtab **ppVtab,
+        char **pzErr)
+{
+    return cdfzReadConnect(db, pAux, argc, argv, ppVtab, pzErr);
+}
+
+/*
+** This method is the destructor of a CdfzVarsRead object.
 */
 static int cdfzReadDisconnect(sqlite3_vtab *pvtab){
     CdfzVarsRead* p = (CdfzVarsRead*) pvtab;
-    int kzvar;
+    int kzvar,k;
 
-    sqlite3_free(p->valtypes);
-    sqlite3_free(p->sqltypes);
-    sqlite3_free(p->nrecs);
-    for( kzvar=0; kzvar<p->nzvars; kzvar++ )
-        CDFdataFree(p->zdatap[kzvar]);
+    for( kzvar=0; kzvar<p->nzvars; kzvar++ ) {
+        if( p->zdatap[kzvar]!=NULL )
+            CDFdataFree(p->zdatap[kzvar]);
+        if( p->ndims[kzvar]>0 ) {
+            sqlite3_free(p->dimszs[kzvar]);
+            sqlite3_free(p->dimvars[kzvar]);
+        }
+    }
     sqlite3_free(p->zdatap);
+    sqlite3_free(p->nrecs);
+    sqlite3_free(p->dimvars);
+    sqlite3_free(p->recvars);
+    sqlite3_free(p->dimszs);
+    sqlite3_free(p->ndims);
+    sqlite3_free(p->nelems);
+    sqlite3_free(p->nbytes);
+    sqlite3_free(p->cdf2sql);
+    sqlite3_free(p->sqltypes);
+
+    /* sqlite3_free(p->cdfvtp.name); */
 
     return cdfVTabDisconnect(pvtab);
 }
 
-/* A cursor for the CDF read zvars virtual table */
+/*
+** Only a forward full table scan is supported.
+** A binary search could be done if the MONOTON attribute is set, to be implemented. 
+*/
+static int cdfzReadBestIndex(
+        sqlite3_vtab *vtabp,
+        sqlite3_index_info *idxinfop
+){
+    CdfzVarsRead *vp = (CdfzVarsRead*) vtabp;
+    CDFstatus status;
+    long kzvar;
+    long maxrec;
+
+    if( idxinfop->nConstraint>0 ) {
+        printf("zReadBestIndex: nConstraint = %d\n", idxinfop->nConstraint);
+        for( int k=0; k<idxinfop->nConstraint; k++ )
+            printf("  k=%d,  iCol = %d, op = %d, usb = %d\n",
+                    idxinfop->aConstraint[k].iColumn, idxinfop->aConstraint[k].op,
+                    idxinfop->aConstraint[k].usable);
+    }
+
+    if( idxinfop->nConstraint>0 )
+        kzvar = idxinfop->aConstraint[0].iColumn;
+    else
+        kzvar = 0;
+    status = CDFgetzVarMaxWrittenRecNum(vp->cdfvtp.id, kzvar, &maxrec);
+    idxinfop->idxNum = 1;
+    idxinfop->idxStr = "";
+    idxinfop->estimatedCost = maxrec;
+    return SQLITE_OK;
+}
+
+/* A cursor for the CDF records of zVars: */
 typedef struct CdfzReadCursor CdfzReadCursor;
 struct CdfzReadCursor {
-    CdfzVarsRecCursor  zrcur;     /* Base class.  Must be first */
-    CdfzVarsRead      *vtabp;      
+    sqlite3_vtab_cursor basecur;     /* Base class.  Must be first */
+    CdfzVarsRead       *zreadvtp;    /* Pointer to the zVars simplified read vtab*/ 
+    CDFid               id;          /* CDF file identifier, replicated for convenience */
+    sqlite_int64        recid;       /* row/record id, starting with 1 */
 };
+/*
+** xFilter simply rewinds to the beginning.
+** A binary search could perhaps be done if the MONOTON attribute is set, still needs to be implemented. 
+*/
+static int cdfzReadFilter(
+        sqlite3_vtab_cursor *cp, 
+        int idxNum, const char *idxStr,
+        int argc, sqlite3_value **argv
+){
+    ((CdfzReadCursor*) cp)->recid = 1;
+    return SQLITE_OK;
+}
+static int cdfzReadNext(sqlite3_vtab_cursor *cp) {
+    ((CdfzReadCursor*) cp)->recid += 1;
+    return SQLITE_OK;
+}
+static int cdfzReadEof(sqlite3_vtab_cursor *curp) {
+    CdfzReadCursor *cp = (CdfzReadCursor*) curp;
+    long zvarsmaxw;
+
+    CDFstatus status = CDFgetzVarsMaxWrittenRecNum(cp->id, &zvarsmaxw);
+
+    return cp->recid > zvarsmaxw+1;
+}
+static int cdfzReadRowid(sqlite3_vtab_cursor *cp, sqlite_int64 *rowidp) {
+    *rowidp = ((CdfzReadCursor*) cp)->recid;
+    return SQLITE_OK;
+}
+
+/*
+** Constructor of a simplified read cursor for records of Cdf zVars.
+*/
+static int cdfzReadOpen(
+        sqlite3_vtab* vtabp,
+        sqlite3_vtab_cursor** ppcur
+){
+    /* long nzvars; */
+    CDFstatus status;
+    CdfzVarsRead   *vp = (CdfzVarsRead*) vtabp;
+    CdfzReadCursor *cp = sqlite3_malloc64(sizeof(CdfzReadCursor));
+    if( cp==0 ) return SQLITE_NOMEM;
+
+    cp->zreadvtp = vp;
+    cp->id       = vp->cdfvtp.id;
+    cp->recid    = 1;
+
+    *ppcur = (sqlite3_vtab_cursor*) cp;
+    /* printf("zRecsCursor opened\n"); */
+    return SQLITE_OK;
+}
+
+static int cdfzReadClose(sqlite3_vtab_cursor *curp)
+{
+    sqlite3_free((CdfzReadCursor*) curp);
+
+    return SQLITE_OK;
+}
+
+static void read_cdfdouble(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_double(ctx, ((double*) zdatap)[recid-1]);
+}
+
+static void read_cdfsingle(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_double(ctx, (double) ((float*) zdatap)[recid-1]);
+}
+
+static void read_cdflong(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int64(ctx, (sqlite3_int64) ((long*) zdatap)[recid-1]);
+}
+
+static void read_cdfint(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int(ctx, ((int*) zdatap)[recid-1]);
+}
+
+static void read_cdfuint(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int64(ctx, (sqlite3_int64) ((unsigned*) zdatap)[recid-1]);
+}
+
+static void read_cdfshort(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int(ctx, (int) ((short*) zdatap)[recid-1]);
+}
+
+static void read_cdfushort(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int(ctx, (int) ((unsigned short*) zdatap)[recid-1]);
+}
+
+static void read_cdfbyte(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int(ctx, (int) ((signed char*) zdatap)[recid-1]);
+}
+
+static void read_cdfubyte(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
+    sqlite3_result_int(ctx, (int) ((unsigned char*) zdatap)[recid-1]);
+}
+
+static void read_cdfstring(sqlite3_context *ctx, CDFdata zdatap, long recid, long nelems) {
+    /* CDF strings are not necessarily 0-terminated, therefore intermediate copying is needed:  */
+    char *buf = sqlite3_malloc(nelems+1);
+    bzero(buf, nelems+1);
+    stpncpy(buf, &((char*) zdatap)[nelems*(recid-1)], nelems);
+    buf[nelems+1] = '\0';
+    sqlite3_result_text(ctx, buf, -1, sqlite3_free);
+}
+
+static void read_cdfblob(sqlite3_context *ctx, CDFdata zdatap, long recid, long nbytes) {
+    sqlite3_result_blob64(ctx, &((char *) zdatap)[nbytes*(recid-1)], nbytes, SQLITE_STATIC);
+}
+
+#define READFUN_DOUBLE 0
+#define READFUN_SINGLE 1
+#define READFUN_LONG   2
+#define READFUN_INT    3
+#define READFUN_UINT   4
+#define READFUN_SHORT  5
+#define READFUN_USHORT 6
+#define READFUN_BYTE   7
+#define READFUN_UBYTE  8 
+#define READFUN_STRING 9 
+#define READFUN_BLOB   10
 
 static int cdfzReadColumn(
         sqlite3_vtab_cursor *curp,  /* The cursor */
@@ -2193,24 +2435,84 @@ static int cdfzReadColumn(
         int iCol
 ){
     CdfzReadCursor *cp = (CdfzReadCursor*) curp;
-    CdfzVarsRead   *vp = cp->vtabp;
+    CdfzVarsRead   *vp = cp->zreadvtp;
     CDFstatus status = CDF_OK;
 
-    char **pzErr = &cp->vtabp->cdfvtp.base.zErrMsg;
+    /* char **pzErr = &cp->vtabp->cdfvtp.base.zErrMsg; */
+    char **pzErr = &cp->basecur.pVtab->zErrMsg;
 
-    if( iCol==0 )
-        sqlite3_result_int64(ctx, cp->zrcur.recid);
+    static void (*read_cdf[10])(sqlite3_context*, CDFdata, long, long) = {
+        read_cdfdouble, read_cdfsingle, read_cdflong, read_cdfint,
+        read_cdfuint, read_cdfshort, read_cdfbyte, read_cdfubyte, read_cdfstring, read_cdfblob
+    };
+
+    if( iCol==0 ) /* The 1st (zero) column is the row or record id */
+        sqlite3_result_int64(ctx, cp->recid);
     else if( iCol>0 && iCol<=vp->nzvars) { 
-        if( vp->zdatap[iCol-1]==NULL ) {
-            status = CDFreadzVarDataByVarID(cp->zrcur.id, (long) iCol-1, &vp->nrecs[iCol-1], &vp->zdatap[iCol-1]);
+        int kcol = iCol-1;
+        /* Data not yet read by the CDF library? */
+        if( vp->zdatap[kcol]==NULL ) {
+            long ndims;
+            CDFstatus status  = CDFgetzVarNumDims(cp->id, kcol, &ndims);
+            vp->dimszs[kcol]  = sqlite3_malloc(ndims*sizeof(long));
+            vp->dimvars[kcol] = sqlite3_malloc(ndims*sizeof(long));
+            long cdftype;
+
+            status = CDFreadzVarAllByVarID(cp->id, (long) kcol,
+                    &vp->nrecs[kcol], &cdftype, &vp->nelems[kcol], &vp->ndims[kcol], vp->dimszs[kcol], 
+                    &vp->recvars[kcol], vp->dimvars[kcol], &vp->zdatap[kcol]);
             if( status<CDF_OK ) {
                 char statustext[CDF_STATUSTEXT_LEN+1];
                 CDFgetStatusText(status, statustext);
                 *pzErr = sqlite3_mprintf("When reading zVar %d data: %s", iCol, statustext);
                 return SQLITE_ERROR;
             }
+            vp->nbytes[kcol] = (cdftype==CDF_CHAR || cdftype==CDF_UCHAR) ? vp->nelems[kcol] : cdf_elsize(cdftype);
+            if( vp->ndims[kcol]>0 ) {
+                for( int kdim=0; kdim<vp->ndims[kcol]; kdim++ )
+                    vp->nbytes[kcol] *= vp->dimszs[kcol][kdim];
+                (vp->cdf2sql)[kcol] = read_cdf[9]; /*multidimenional data are read as blob */
+            } else {
+                switch (cdftype) {
+                    case CDF_REAL8:
+                    case CDF_DOUBLE:
+                    case CDF_EPOCH:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_DOUBLE];
+                        break;
+                    case CDF_REAL4:
+                    case CDF_FLOAT:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_SINGLE];
+                        break;
+                    case CDF_INT8:
+                    case CDF_TIME_TT2000:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_LONG];
+                        break;
+                    case CDF_INT4:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_INT];
+                        break;
+                    case CDF_UINT4:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_UINT];
+                        break;
+                    case CDF_INT2:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_SHORT];
+                        break;
+                    case CDF_UINT2:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_USHORT];
+                        break;
+                    case CDF_INT1:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_BYTE];
+                        break;
+                    case CDF_UINT1:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_UBYTE];
+                        break;
+                    case CDF_CHAR:
+                    case CDF_UCHAR:
+                        vp->cdf2sql[kcol] = read_cdf[READFUN_STRING];
+                }
+            }
+            
         }
-        int sqltype = vp->sqltypes[iCol-1];
+        vp->cdf2sql[kcol](ctx, vp->zdatap[kcol], cp->recid, vp->nbytes[kcol]);
     } else {
         *pzErr = sqlite3_mprintf("iCol %d not a valid column number", iCol);
         return SQLITE_ERROR;
@@ -2218,6 +2520,31 @@ static int cdfzReadColumn(
 
     return SQLITE_OK;
 }
+
+static sqlite3_module CdfzReadModule = {
+  0,                      /* iVersion */
+  cdfzReadCreate,         /* xCreate */
+  cdfzReadConnect,        /* xConnect */
+  cdfzReadBestIndex,      /* xBestIndex */
+  cdfzReadDisconnect,     /* xDisconnect */
+  cdfzReadDisconnect,     /* xDestroy */
+  cdfzReadOpen,           /* xOpen - open a cursor */
+  cdfzReadClose,          /* xClose - close a cursor */
+  cdfzReadFilter,         /* xFilter - configure scan constraints */
+  cdfzReadNext,           /* xNext - advance a cursor */
+  cdfzReadEof,            /* xEof - check for end of scan */
+  cdfzReadColumn,         /* xColumn - read data */
+  cdfzReadRowid,          /* xRowid - row nr */
+  0,                      /* xUpdate - insert, update, delete CDF records, inactive */
+  0,                      /* xBegin */
+  0,                      /* xSync */
+  0,                      /* xCommit */
+  0,                      /* xRollback */
+  0,                      /* xFindMethod */
+  0,                      /* xRename */
+};
+
+/* End of module CdfzRead using the "simplified CDFread functions", section 6.5 of the CRM */
 
 /* Module CdfAttr */
 
@@ -3871,7 +4198,10 @@ int sqlite3_cdf_init(
   rc = sqlite3_create_module(db, "cdfzvars", &CdfzVarsModule, 0);
   if( rc!=SQLITE_OK ) return rc;
 
-  rc = sqlite3_create_module(db, "cdfzrecs", &CdfRecsModule, 0);
+  rc = sqlite3_create_module(db, "cdfzrecs", &CdfzRecsModule, 0);
+  if( rc!=SQLITE_OK ) return rc;
+
+  rc = sqlite3_create_module(db, "cdfzread", &CdfzReadModule, 0);
   if( rc!=SQLITE_OK ) return rc;
 
   rc = sqlite3_create_module(db, "cdfattrs", &CdfAttrsModule, 0);
