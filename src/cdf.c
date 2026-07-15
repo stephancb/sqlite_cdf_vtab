@@ -30,6 +30,8 @@ SQLITE_EXTENSION_INIT1
 
 #include <cdf.h>
 
+static const char* NaNstring="NaN";
+
 typedef struct CdfVTab CdfVTab;
 struct CdfVTab {         /* All CDF tables have the CDFid file id and a mode: */
   sqlite3_vtab base;     /* Base class.  Must be first */
@@ -294,22 +296,24 @@ static int cdf_add_subtab(
             mnnm, subnm, modnm, id, submode);
 
     if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
-        *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s%s\n", mnnm, subnm);
-        return rc;
+          *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s%s\n", mnnm, subnm);
+          return rc;
     }
 
     if( vtp->nsubtabs>=CDF_MAX_NUM_SUBTABS ) {
-        *pzErr = sqlite3_mprintf("CdfFileConnect: more than %d subtabs, recompile!\n", CDF_MAX_NUM_SUBTABS);
+        *pzErr = sqlite3_mprintf("CdfFileConnect: more than %d subtabs, enlarge and recompile!\n",
+                                    CDF_MAX_NUM_SUBTABS);
         return SQLITE_ERROR;
     }
     vtp->submodes[vtp->nsubtabs] = submode;
-    vtp->names[vtp->nsubtabs] = sqlite3_malloc(strlen(mnnm)+7);
+    vtp->names[vtp->nsubtabs] = sqlite3_malloc(strlen(mnnm)+strlen(subnm)+2);
     if( vtp->names[vtp->nsubtabs]==0 )
         return SQLITE_NOMEM;
     stpcpy(stpcpy(vtp->names[vtp->nsubtabs], mnnm), subnm);
     vtp->nsubtabs++;
 
-    sqlite3_free(sqlite3_str_finish(zsql));
+    /* sqlite3_free(sqlite3_str_finish(zsql)); */
+    sqlite3_str_free(zsql);
 
     return SQLITE_OK;
 }
@@ -334,7 +338,7 @@ static int cdfFileConnect(
     char        *z;
     sqlite3_str *zsql = sqlite3_str_new(db);
     CdfFileVTab *filevtabp;
-    char         name[CDF_PATHNAME_LEN+4],mstr[4],mode,submode;
+    char         name[CDF_PATHNAME_LEN+4],mstr[4],mode='r',submode='n';
     const char  *subtaberr = "CdfFileConnect: cannot create vtab %s%s\n";
     long         kzepoch;
     int          rc;
@@ -396,6 +400,7 @@ static int cdfFileConnect(
     sqlite3_str_appendf(zsql, "CREATE TABLE cdf_file_ignored (\n");
     sqlite3_str_appendf(zsql, "    cdfid INTEGER PRIMARY KEY,\n");
     sqlite3_str_appendf(zsql, "    name TEXT NOT NULL\n);\n");
+
     rc = sqlite3_declare_vtab(db, sqlite3_str_value(zsql));
     if( rc!=SQLITE_OK ) {
         *pzErr = sqlite3_mprintf("CdfFileConnect: bad schema \n%s\nerror code = %d\n", z, rc);
@@ -438,11 +443,11 @@ static int cdfFileConnect(
     if( rc!=SQLITE_OK ) goto exitlabel;
 
     if( mode=='r' ) {
-        rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zread", (long) id, "_zread", pzErr);
-        if( rc!=SQLITE_OK ) goto exitlabel;
+        if( cdf_add_subtab(db, filevtabp, submode, argv[2], "zread", (long) id, "_zread", pzErr)!=SQLITE_OK )
+            goto exitlabel;
     } else {
-        rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zrecs", (long) id, "_zrecs", pzErr);
-        if( rc!=SQLITE_OK ) goto exitlabel;
+        if( cdf_add_subtab(db, filevtabp, submode, argv[2], "zrecs", (long) id, "_zrecs", pzErr)!=SQLITE_OK )
+            goto exitlabel;
     }
 
     rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "attrs", (long) id, "_attrs", pzErr);
@@ -461,7 +466,7 @@ static int cdfFileConnect(
 
     rc = SQLITE_OK;
 exitlabel:
-    sqlite3_free(sqlite3_str_finish(zsql));
+    sqlite3_str_free(zsql);
 
     return rc;
 }
@@ -1018,6 +1023,13 @@ static CDFstatus result_padvalue(sqlite3_context *ctx, CDFid id, long kzvar) {
 
     switch (cdf_sqlitetype(datatype)) {
         case SQLITE_FLOAT:
+            double res = ((double*) value)[0];
+            if( res!=res ) /* NaN */
+                sqlite3_result_text(ctx, NaNstring, 3, SQLITE_STATIC);
+            else
+                sqlite3_result_double(ctx, ((double*) value)[0]);
+            break;
+                
             sqlite3_result_double(ctx, ((double*) value)[0]);
             break;
         case SQLITE_INTEGER:
@@ -1208,7 +1220,6 @@ static int cdfzVarsUpdate(
 ) {
     CdfVTab *vp = (CdfVTab*) vtabp;
     CDFstatus status;
-    const char *varName;
     char *zrecnm;
     long datatype;
     long numelem,numdims,*dimsizes=NULL,recvariance,*dimvars=NULL,varnum,nzvars;
@@ -1242,7 +1253,12 @@ static int cdfzVarsUpdate(
         default:  /* create or update a zVar */
             switch( sqlite3_value_type(argv[0]) ) {
                 case SQLITE_NULL: /* SQLite INSERT creates a zVar: */
-                    varName = sqlite3_value_text(argv[3]);
+                    const unsigned char* varName = sqlite3_value_text(argv[3]);
+                    if( CDFvarNum(vp->id, (char*) varName)>=0 ) {
+                            vtabp->zErrMsg = sqlite3_mprintf("zVarsUpdate: zVar %s exists already\n", varName);
+                            return SQLITE_ERROR;
+                        }
+
 
                     if( sqlite3_value_type(argv[4])==SQLITE_INTEGER || sqlite3_value_type(argv[4])==SQLITE_FLOAT ) {
                         datatype = sqlite3_value_int64(argv[4]);
@@ -1369,6 +1385,7 @@ static int cdfzVarsUpdate(
 
                     if( sqlite3_value_type(argv[11])!=SQLITE_NULL ) { /* maxalloc */
                         long nalloc = sqlite3_value_int64(argv[11]);
+                        printf("cdfzVarsUpdate: nalloc) = %d\n", nalloc);
                         status = CDFsetzVarAllocRecords(vp->id, varnum, nalloc);
                         if( status<CDF_OK ) {
                             char statustext[CDF_STATUSTEXT_LEN+1];
@@ -1407,7 +1424,7 @@ static int cdfzVarsUpdate(
                     }
                     varnum = sqlite3_value_int64(argv[0])-1;
                     if( !sqlite3_value_nochange(argv[3]) ) {
-                        varName = sqlite3_value_text(argv[3]);
+                        const unsigned char* varName = sqlite3_value_text(argv[3]);
                         status = CDFrenamezVar(vp->id, varnum, varName);
                         if( status<CDF_OK ) {
                             char statustext[CDF_STATUSTEXT_LEN+1];
@@ -1620,10 +1637,12 @@ static int cdfzRecsBestIndex(
     long maxrec;
 
     if( idxinfop->nConstraint>0 ) {
+        /*
         for( int k=0; k<idxinfop->nConstraint; k++ )
             printf("  k=%d,  iCol = %d, op = %d, usb = %d\n",
                     idxinfop->aConstraint[k].iColumn, idxinfop->aConstraint[k].op,
                     idxinfop->aConstraint[k].usable);
+        */
     }
 
     if( idxinfop->nConstraint>0 )
@@ -2190,7 +2209,7 @@ static int cdfzReadConnect(
 
     z = sqlite3_str_value(zsql);
 
-    printf("z = \n%s\n", z);
+    /* printf("z = \n%s\n", z); */
 
     rc = sqlite3_declare_vtab(db, z);
     if( rc!=SQLITE_OK ) {
@@ -2284,11 +2303,13 @@ static int cdfzReadBestIndex(
     long maxrec;
 
     if( idxinfop->nConstraint>0 ) {
+        /*
         printf("zReadBestIndex: nConstraint = %d\n", idxinfop->nConstraint);
         for( int k=0; k<idxinfop->nConstraint; k++ )
             printf("  k=%d,  iCol = %d, op = %d, usb = %d\n",
                     idxinfop->aConstraint[k].iColumn, idxinfop->aConstraint[k].op,
                     idxinfop->aConstraint[k].usable);
+        */
     }
 
     if( idxinfop->nConstraint>0 )
@@ -2402,6 +2423,10 @@ static void read_cdfbyte(sqlite3_context *ctx, CDFdata zdatap, long recid, long)
 
 static void read_cdfubyte(sqlite3_context *ctx, CDFdata zdatap, long recid, long) {
     sqlite3_result_int(ctx, (int) ((unsigned char*) zdatap)[recid-1]);
+    /*
+    printf("read_cdfubyte: zdatap[%d-1] = %d\n", recid, ((unsigned char*) zdatap)[recid-1]);
+    sqlite3_result_int(ctx, ((unsigned char*) zdatap)[recid-1]);
+    */
 }
 
 static void read_cdfstring(sqlite3_context *ctx, CDFdata zdatap, long recid, long nelems) {
@@ -2441,9 +2466,9 @@ static int cdfzReadColumn(
     /* char **pzErr = &cp->vtabp->cdfvtp.base.zErrMsg; */
     char **pzErr = &cp->basecur.pVtab->zErrMsg;
 
-    static void (*read_cdf[10])(sqlite3_context*, CDFdata, long, long) = {
-        read_cdfdouble, read_cdfsingle, read_cdflong, read_cdfint,
-        read_cdfuint, read_cdfshort, read_cdfbyte, read_cdfubyte, read_cdfstring, read_cdfblob
+    static void (*read_cdf[11])(sqlite3_context*, CDFdata, long, long) = {
+        read_cdfdouble, read_cdfsingle, read_cdflong, read_cdfint, read_cdfuint,
+        read_cdfshort, read_cdfushort, read_cdfbyte, read_cdfubyte, read_cdfstring, read_cdfblob
     };
 
     if( iCol==0 ) /* The 1st (zero) column is the row or record id */
@@ -3855,6 +3880,7 @@ typedef struct CdfEpochsVTab CdfEpochsVTab;
 struct CdfEpochsVTab {
     CdfVTab      cdfvtp;            /* Parent class.  Must be first */
     long         kzepoch;           /* zVar number with datatype CDF_EPOCH */
+    /* double      *epochp;            /* Pointer to the CDF buffer of epochs, NULL if not yet read.*/
 };
 typedef struct CdfEpochsCursor CdfEpochsCursor;
 struct CdfEpochsCursor {
@@ -3935,6 +3961,7 @@ static int cdfEpochsConnect(
     vtabp->cdfvtp.name = sqlite3_malloc( strlen(argv[2])+1 );
     stpcpy(vtabp->cdfvtp.name, argv[2]);
     vtabp->kzepoch = kzepoch;
+    /* vtabp->cdfvtp.epochp = NULL; */
 
     *ppVtab = (sqlite3_vtab*) vtabp;
 
@@ -3946,9 +3973,11 @@ static int cdfEpochsDisconnect(sqlite3_vtab *pvtab){
     int rc = SQLITE_OK;
 
     /* printf("EpochsDisconnect: pv->cdfvtp.mode=%c, pv->cdfvtp.name = %s\n", pv->cdfvtp.mode, pv->cdfvtp.name); */
-    /* Close the CDF file, unless the Epochs is a subtable: */ 
-    if( strchr("st", pv->cdfvtp.mode)==NULL )
+    /* Close the CDF file and free the CDF buffer, unless the Epochs is a subtable: */ 
+    if( strchr("st", pv->cdfvtp.mode)==NULL ) {
+        /* CDFdataFree(p->epochp); */
         rc = cdf_close(&pv->cdfvtp);
+    }
     sqlite3_free(pv->cdfvtp.name);
     sqlite3_free(pv);
 
