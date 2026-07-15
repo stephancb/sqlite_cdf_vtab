@@ -284,34 +284,40 @@ struct CdfFileVTab {     /* Includes also sybtables which must be dropped when d
 
 #define CDF_MAX_NUM_SUBTABS 9
 
-static int cdf_add_subtab(
+static int cdf_create_subtab(
         sqlite3 *db, CdfFileVTab *vtp, char submode, const char *mnnm,
         const char *modnm, long id, const char *subnm, char **pzErr)
 {
     sqlite3_str *zsql = sqlite3_str_new(db);
-    int rc;
+    int rc=-1;
 
     sqlite3_str_reset(zsql);
     sqlite3_str_appendf(zsql, "CREATE VIRTUAL TABLE %s%s USING cdf%s('%d','%c')",
             mnnm, subnm, modnm, id, submode);
 
     if( (rc = sqlite3_exec(db, sqlite3_str_value(zsql), NULL, NULL, NULL))!=SQLITE_OK ) {
-          *pzErr = sqlite3_mprintf("CdfFileConnect: cannot create vtab %s%s\n", mnnm, subnm);
-          return rc;
+          *pzErr = sqlite3_mprintf("CdfFileConnect:\n   %s\nfailed\n", sqlite3_str_value(zsql));
+          goto exitlabel;
     }
 
-    if( vtp->nsubtabs>=CDF_MAX_NUM_SUBTABS ) {
-        *pzErr = sqlite3_mprintf("CdfFileConnect: more than %d subtabs, enlarge and recompile!\n",
-                                    CDF_MAX_NUM_SUBTABS);
-        return SQLITE_ERROR;
+    int nsts = vtp->nsubtabs;
+    if( nsts>=CDF_MAX_NUM_SUBTABS ) {
+        *pzErr = sqlite3_mprintf("CdfFileConnect: more than %d subtabs are requested!\n",
+                CDF_MAX_NUM_SUBTABS);
+        rc = SQLITE_ERROR;
+        goto exitlabel;
     }
-    vtp->submodes[vtp->nsubtabs] = submode;
-    vtp->names[vtp->nsubtabs] = sqlite3_malloc(strlen(mnnm)+strlen(subnm)+2);
-    if( vtp->names[vtp->nsubtabs]==0 )
-        return SQLITE_NOMEM;
-    stpcpy(stpcpy(vtp->names[vtp->nsubtabs], mnnm), subnm);
+    vtp->submodes[nsts] = submode;
+    vtp->names[nsts] = sqlite3_malloc(strlen(mnnm)+strlen(subnm)+2);
+    if( vtp->names[nsts]==0 ) {
+        rc = SQLITE_NOMEM;
+        goto exitlabel;
+    }
+    stpcpy(stpcpy(vtp->names[nsts], mnnm), subnm);
     vtp->nsubtabs++;
 
+    rc = SQLITE_OK;
+exitlabel:
     /* sqlite3_free(sqlite3_str_finish(zsql)); */
     sqlite3_str_free(zsql);
 
@@ -439,28 +445,28 @@ static int cdfFileConnect(
         goto exitlabel;
     }
 
-    rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "zvars", (long) id, "_zvars", pzErr);
+    rc = cdf_create_subtab(db, filevtabp, submode, argv[2], "zvars", (long) id, "_zvars", pzErr);
     if( rc!=SQLITE_OK ) goto exitlabel;
 
     if( mode=='r' ) {
-        if( cdf_add_subtab(db, filevtabp, submode, argv[2], "zread", (long) id, "_zread", pzErr)!=SQLITE_OK )
+        if( cdf_create_subtab(db, filevtabp, submode, argv[2], "zread", (long) id, "_zread", pzErr)!=SQLITE_OK )
             goto exitlabel;
     } else {
-        if( cdf_add_subtab(db, filevtabp, submode, argv[2], "zrecs", (long) id, "_zrecs", pzErr)!=SQLITE_OK )
+        if( cdf_create_subtab(db, filevtabp, submode, argv[2], "zrecs", (long) id, "_zrecs", pzErr)!=SQLITE_OK )
             goto exitlabel;
     }
 
-    rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "attrs", (long) id, "_attrs", pzErr);
+    rc = cdf_create_subtab(db, filevtabp, submode, argv[2], "attrs", (long) id, "_attrs", pzErr);
     if( rc!=SQLITE_OK ) goto exitlabel;
 
-    rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "attrgentries", (long) id, "_attrgents", pzErr);
+    rc = cdf_create_subtab(db, filevtabp, submode, argv[2], "attrgentries", (long) id, "_attrgents", pzErr);
     if( rc!=SQLITE_OK ) goto exitlabel;
 
-    rc = cdf_add_subtab(db, filevtabp, submode, argv[2], "attrzentries", (long) id, "_attrzents", pzErr);
+    rc = cdf_create_subtab(db, filevtabp, submode, argv[2], "attrzentries", (long) id, "_attrzents", pzErr);
     if( rc!=SQLITE_OK ) goto exitlabel;
    
     if( (kzepoch=cdf_find_epoch(id))>=0 ) {
-        rc = cdf_add_subtab(db, filevtabp, 's', argv[2], "epochs", (long) id, "_epochs", pzErr);
+        rc = cdf_create_subtab(db, filevtabp, 's', argv[2], "epochs", (long) id, "_epochs", pzErr);
         if( rc!=SQLITE_OK ) goto exitlabel;
     }
 
